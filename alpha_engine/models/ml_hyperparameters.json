@@ -1,0 +1,99 @@
+{
+  "comment": "Default configuration (current baseline)",
+  "ensemble": {
+    "models": ["lr", "rf", "gb"],
+    "weights": {
+      "lr": 0.3,
+      "rf": 0.4,
+      "gb": 0.3
+    }
+  },
+  "lr": {
+    "solver": "liblinear",
+    "max_iter": 2000,
+    "class_weight": "balanced"
+  },
+  "rf": {
+    "n_estimators": 200,
+    "max_depth": null,
+    "min_samples_split": 2,
+    "class_weight": "balanced",
+    "random_state": 42,
+    "n_jobs": -1
+  },
+  "gb": {
+    "n_estimators": 100,
+    "learning_rate": 0.1,
+    "max_depth": 3,
+    "random_state": 42
+  },
+  "training": {
+    "days_lookback": 180,
+    "interval": "hour",
+    "train_val_split": 0.8
+  },
+  "configs": {
+    "approach_1_regime_filter": {
+      "comment": "Baseline + Regime Detection & Filtering",
+      "training": {
+        "days_lookback": 180,
+        "interval": "hour",
+        "train_val_split": 0.8
+      },
+      "env": {
+        "AE_REGIME_ENABLED": "1",
+        "AE_REGIME_FILTER_ENABLED": "1",
+        "AE_REGIME_VOLATILITY_THRESHOLD": "0.06",
+        "AE_REGIME_TREND_THRESHOLD": "0.08"
+      }
+    },
+    "approach_2_extended_data": {
+      "comment": "Extended training data (365 days)",
+      "training": {
+        "days_lookback": 365,
+        "interval": "hour",
+        "train_val_split": 0.8
+      },
+      "env": {
+        "AE_ML_LOOKBACK_DAYS": "365"
+      }
+    },
+    "approach_3_simple_lr": {
+      "comment": "Simplified LR-only model with top 5 features",
+      "model_type": "logreg",
+      "lr": {
+        "solver": "liblinear",
+        "max_iter": 3000,
+        "class_weight": "balanced",
+        "C": 0.1
+      },
+      "training": {
+        "days_lookback": 365,
+        "interval": "hour",
+        "train_val_split": 0.8
+      },
+      "features": {
+        "top_5_only": true,
+        "selected": ["r_6h", "vol_6h", "social_score", "atr_14h", "sma_gap"]
+      },
+      "env": {
+        "AE_ML_MODEL": "logreg",
+        "AE_ML_LOOKBACK_DAYS": "365",
+        "AE_FEATURE_SELECTION": "top5"
+      }
+    },
+    "approach_4_per_regime": {
+      "comment": "Separate models per market regime",
+      "training": {
+        "days_lookback": 365,
+        "interval": "hour",
+        "train_val_split": 0.8
+      },
+      "env": {
+        "AE_REGIME_ENABLED": "1",
+        "AE_PER_REGIME_MODELS": "1",
+        "AE_ML_LOOKBACK_DAYS": "365"
+      }
+    }
+  }
+}

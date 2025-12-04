@@ -1,0 +1,13 @@
+# Python garbage
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local State (Don't push your paper trading wallet!)
+*_state.json
+paper_test.json
+*.log
+
+# Cursor/VSCode settings
+.vscode/

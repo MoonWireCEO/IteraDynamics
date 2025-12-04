@@ -1,0 +1,177 @@
+name: Walkforward CV
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Comma-separated symbols to audit"
+        required: false
+        default: "BTC,ETH"
+      k_folds:
+        description: "Number of walk-forward folds"
+        required: false
+        default: "5"
+      window_hours:
+        description: "Window size (hours) for each fold evaluation"
+        required: false
+        default: "720"
+      embargo_hours:
+        description: "Embargo gap (hours) between train and test to avoid leakage"
+        required: false
+        default: "6"
+      backfill_run_id:
+        description: "Optional specific backfill-ml-shadow run id to use"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  walkforward:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then python -m pip install -r requirements-dev.txt; fi
+
+      # -------------------------------
+      # 1) Get the shadow log from backfill
+      # -------------------------------
+
+      - name: Download backfilled shadow log (latest success)
+        if: ${{ inputs.backfill_run_id == '' }}
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          repository: ${{ github.repository }}
+          workflow: backfill-ml-shadow          # name of the backfill workflow (change if yours differs)
+          workflow_conclusion: success
+          name: ml-shadow-backfill              # matches the upload name in backfill workflow
+          path: logs/incoming
+          allow_forks: true
+          if_no_artifact_found: error
+
+      - name: Download backfilled shadow log by run id
+        if: ${{ inputs.backfill_run_id != '' }}
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          run_id: ${{ inputs.backfill_run_id }}
+          repo: ${{ github.repository }}
+          name: ml-shadow-backfill
+          path: logs/incoming
+          if_no_artifact_found: error
+
+      - name: Merge downloaded shadow artifacts into canonical log
+        run: |
+          python - <<'PY'
+          import pathlib
+
+          root = pathlib.Path("logs")
+          incoming = root / "incoming"
+          out = root / "signal_inference_shadow.jsonl"
+          out.parent.mkdir(parents=True, exist_ok=True)
+
+          found = list(incoming.rglob("*.jsonl")) if incoming.exists() else []
+          merged = 0
+
+          if found:
+              with out.open("w", encoding="utf-8") as w:
+                  for p in sorted(found):
+                      txt = p.read_text(encoding="utf-8").strip()
+                      if not txt:
+                          continue
+                      # ensure newline termination
+                      if not txt.endswith("\n"):
+                          txt = txt + "\n"
+                      w.write(txt)
+                      merged += 1
+
+          print(f"[merge] merged {merged} file(s) into {out}")
+          if not out.exists() or out.stat().st_size == 0:
+              raise SystemExit("No shadow data available for walk-forward CV")
+          PY
+
+      - name: Show shadow file snapshot
+        run: |
+          echo "Contents of ./logs (recursive):"
+          ls -lahR logs || true
+          echo "---- shadow head ----"
+          head -n 5 logs/signal_inference_shadow.jsonl || true
+          echo "---- shadow tail ----"
+          tail -n 5 logs/signal_inference_shadow.jsonl || true
+          echo "---- shadow line count ----"
+          wc -l logs/signal_inference_shadow.jsonl || true
+
+      # -------------------------------
+      # 2) Run the Purged Walk-Forward Auditor (Python module)
+      # -------------------------------
+
+      - name: Run Purged Walk-Forward CV
+        run: |
+          mkdir -p models
+          python -m scripts.perf.walkforward_auditor \
+            --log-path logs/signal_inference_shadow.jsonl \
+            --symbols "${{ inputs.symbols }}" \
+            --k-folds ${{ inputs.k_folds }} \
+            --window-hours ${{ inputs.window_hours }} \
+            --embargo-hours ${{ inputs.embargo_hours }} \
+            --output models/walkforward_results.json
+
+      - name: Show walk-forward results
+        run: |
+          echo "=== walkforward_results.json ==="
+          cat models/walkforward_results.json || echo "no results file found"
+
+      # -------------------------------
+      # 3) Write summary to GitHub Step Summary
+      # -------------------------------
+
+      - name: Write summary
+        run: |
+          echo "### 📈 Purged Walk-Forward CV" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Symbols:** \`${{ inputs.symbols }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**k-folds:** \`${{ inputs.k_folds }}\`  \`window_hours=${{ inputs.window_hours }}\`  \`embargo_hours=${{ inputs.embargo_hours }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Backfill source:**" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${{ inputs.backfill_run_id }}" ]; then
+            echo "- run id \`${{ inputs.backfill_run_id }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- latest successful \`backfill-ml-shadow\` run" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f models/walkforward_results.json ]; then
+            echo "**Walk-forward results (raw JSON):**" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`\`\`json" >> "$GITHUB_STEP_SUMMARY"
+            cat models/walkforward_results.json >> "$GITHUB_STEP_SUMMARY"
+            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No walk-forward results file found (models/walkforward_results.json)_" >> "$GITHUB_STEP_SUMMARY"
+
+      # -------------------------------
+      # 4) Upload artifacts (optional)
+      # -------------------------------
+
+      - name: Upload walk-forward artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward-results
+          if-no-files-found: warn
+          path: |
+            logs/signal_inference_shadow.jsonl
+            models/walkforward_results.json

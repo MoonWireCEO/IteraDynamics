@@ -1,0 +1,23 @@
+# Core dependencies
+fastapi
+uvicorn
+redis
+httpx
+requests
+vaderSentiment
+certifi>=2024.2.2
+python-dotenv
+schedule
+pydantic
+
+# ML dependencies
+pandas
+scikit-learn
+numpy
+joblib
+yfinance  # For Yahoo Finance adapter
+
+# Signal Engine Core (shared ML/validation engine)
+# For development: pip install -e ../signal-engine-core
+# For production: signal-engine-core>=1.0.0
+-e ../signal-engine-core

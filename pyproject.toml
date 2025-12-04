@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iteradynamics_monorepo"
+version = "0.1.0"
+description = "Monorepo for ApexCortex, MoonWire, and AlphaEngine"
+dependencies = [
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    # Add other libs you use often, e.g., "ccxt", "alpaca-trade-api"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]  # This tells Python to treat the root folders as packages

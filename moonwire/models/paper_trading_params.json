@@ -1,0 +1,11 @@
+{
+  "symbols": ["BTC","ETH"],        // keep SOL out for now
+  "lookback_h": 720,
+  "horizon_min": 180,
+  "fees_bps": 1,
+  "slippage_bps": 2,
+  "capital": 100000,
+  "force_demo": false,
+  "position_size_pct": 0.02,       // 2% risk per trade
+  "stop_loss_pct": 0.05            // 5% max loss per trade
+}

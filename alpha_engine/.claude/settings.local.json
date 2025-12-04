@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/North East Collision/Desktop/alphaengine-backend/**)",
+      "Bash(find:*)",
+      "Bash(cd:*)",
+      "Bash(python replace_tickers.py:*)",
+      "Bash(python replace_env_vars.py:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
