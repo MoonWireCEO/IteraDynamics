@@ -2,15 +2,17 @@ import time
 import logging
 import signal
 import sys
-import random
+import requests
+import joblib # Needed to save the dummy model if real one is missing
+import numpy as np
 from pathlib import Path
 from datetime import datetime, timezone
-import requests
 
-# Import the Core Architecture
+# --- ARCHITECTURE IMPORTS ---
 from apex_core.paper_broker import PaperBroker
+from moonwire.strategies.ml_adapter import MLStrategyAdapter
 
-# Setup Logging
+# --- LOGGING SETUP ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -19,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger("MoonWire_Live")
 
 # ---------------------------------------------------------------------
-# MOCKS (Placeholders for your real code)
+# DATA FEED (COINBASE)
 # ---------------------------------------------------------------------
 class CoinbasePublicFeed:
     """Fetches REAL live prices from Coinbase Public API (US-Friendly)."""
@@ -38,30 +40,18 @@ class CoinbasePublicFeed:
             return price
         except Exception as e:
             logger.error(f"Data Feed Error: {e}")
-            # Fallback to keep loop alive
-            return 95000.0
-
-class MockStrategy:
-    """Simulates your ML Model + Feature Engineering."""
-    def analyze(self, price: float) -> str:
-        # Randomly generate signals for testing the loop
-        # 10% chance to BUY, 10% chance to SELL, 80% HOLD
-        roll = random.random()
-        if roll < 0.10:
-            return "BUY"
-        elif roll > 0.90:
-            return "SELL"
-        return "HOLD"
+            # Fallback to prevent crash loop, using a safe 'hold' number logic in strategy
+            return 0.0
 
 # ---------------------------------------------------------------------
-# THE LIVE ENGINE
+# THE LIVE ENGINE (HEARTBEAT)
 # ---------------------------------------------------------------------
 class LiveEngine:
-    def __init__(self, symbol: str, broker: PaperBroker):
+    def __init__(self, symbol: str, broker: PaperBroker, strategy: object, feed: object):
         self.symbol = symbol.upper()
         self.broker = broker
-        self.feed = CoinbasePublicFeed()      # <--- We will swap this later
-        self.strategy = MockStrategy()  # <--- We will swap this later
+        self.feed = feed
+        self.strategy = strategy
         self.running = True
 
         # Handle Ctrl+C gracefully
@@ -72,9 +62,10 @@ class LiveEngine:
         logger.info("\n🛑 Shutdown signal received. Saving state...")
         self.running = False
 
-    def run_loop(self, interval_seconds: int = 5):
+    def run_loop(self, interval_seconds: int = 60):
         logger.info(f"🚀 Starting Engine on {self.symbol}")
         logger.info(f"💰 Balance: ${self.broker.get_balance():,.2f}")
+        logger.info(f"🧠 Strategy: {self.strategy.__class__.__name__}")
         logger.info(f"Press Ctrl+C to stop.\n")
 
         while self.running:
@@ -82,28 +73,30 @@ class LiveEngine:
                 # 1. FETCH DATA
                 price = self.feed.fetch_latest_price(self.symbol)
                 
+                if price <= 0:
+                    time.sleep(5)
+                    continue
+
                 # 2. STRATEGY INFERENCE
+                # The adapter handles memory, feature engineering, and governance inside here
                 signal = self.strategy.analyze(price)
                 
                 # 3. EXECUTION LOGIC
-                # (Simple logic: If Buy signal and we have no position -> Buy)
-                # (If Sell signal and we have position -> Sell)
-                
                 current_pos = self.broker.get_position(self.symbol)
                 
                 if signal == "BUY" and current_pos == 0:
                     logger.info(f"🟢 SIGNAL: BUY {self.symbol} @ {price:.2f}")
-                    # Size: Buy 0.1 BTC (Hardcoded for test)
+                    # Example Size: Buy 0.1 BTC (You can make this dynamic later)
                     self.broker.submit_order(self.symbol, "BUY", 0.1, price)
                     
                 elif signal == "SELL" and current_pos > 0:
                     logger.info(f"🔴 SIGNAL: SELL {self.symbol} @ {price:.2f}")
-                    # Size: Sell everything
+                    # Size: Sell entire position
                     self.broker.submit_order(self.symbol, "SELL", current_pos, price)
                 
                 else:
-                    # Heartbeat log (optional, keeps you sane)
-                    # logger.debug(f"Holding... {price:.2f}")
+                    # Optional: Log 'HOLD' if you want verbose output, otherwise keep silent
+                    # logger.info(f"Feature Check: HOLD (Position: {current_pos})")
                     pass
 
                 # 4. SLEEP
@@ -111,24 +104,82 @@ class LiveEngine:
 
             except Exception as e:
                 logger.error(f"⚠️ Crash in loop: {e}")
-                time.sleep(interval_seconds) # Safety backoff
+                time.sleep(10) # Safety backoff
 
         logger.info("✅ Engine stopped safely.")
+
+# ---------------------------------------------------------------------
+# HELPER: GENERATE DUMMY MODEL (If real one missing)
+# ---------------------------------------------------------------------
+def ensure_model_exists(path: Path):
+    """Creates a dummy sklearn model if the real one isn't found."""
+    if not path.exists():
+        logger.warning(f"⚠️ Model file not found at {path}")
+        logger.warning("🛠️ Generating DUMMY model for testing purposes...")
+        
+        from sklearn.linear_model import LogisticRegression
+        # Create a dummy model trained on random data just so .predict_proba works
+        X_dummy = np.random.rand(10, 12) # 10 rows, 12 features (matches feature_builder)
+        y_dummy = np.random.randint(0, 2, 10)
+        
+        model = LogisticRegression()
+        model.fit(X_dummy, y_dummy)
+        
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(model, path)
+        logger.info(f"✅ Dummy model saved to {path}")
 
 # ---------------------------------------------------------------------
 # ENTRY POINT
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    # Initialize the Paper Broker
-    # Note: We save the state in the root folder so it's easy to find
-    state_path = Path("moonwire_paper_state.json")
-    
-    broker = PaperBroker(
-        state_file=state_path,
-        initial_capital=10000.0,
-        slippage_bps=5
-    )
+    try:
+        print("--- CHECKPOINT 1: Setup Paths ---")
+        # 1. Setup Paths
+        state_path = Path(__file__).parent / "paper_state.json"
+        
+        model_path = Path("apex_core/models/btc_model_v1.pkl")
+        ensure_model_exists(model_path)
 
-    # Launch the Engine
-    engine = LiveEngine(symbol="BTC", broker=broker)
-    engine.run_loop(interval_seconds=2) # Fast loop for testing
+        print("--- CHECKPOINT 2: Initialize Broker ---")
+        # 2. Initialize Components
+        broker = PaperBroker(
+            state_file=state_path,
+            initial_capital=10000.0,
+            slippage_bps=5
+        )
+        
+        # Force save state to ensure file exists (if new)
+        if not state_path.exists():
+            broker._save_state()
+
+        print("--- CHECKPOINT 3: Initialize Feed ---")
+        # Initialize Feed
+        feed = CoinbasePublicFeed()
+
+        print("--- CHECKPOINT 4: Initialize Strategy ---")
+        # Initialize Strategy Adapter (Connecting to Apex Core Brain)
+        strategy = MLStrategyAdapter(
+            symbol="BTC", 
+            model_path=str(model_path),
+            lookback_window=48 
+        )
+
+        print("--- CHECKPOINT 5: Launch Engine ---")
+        # 3. Launch Engine
+        engine = LiveEngine(
+            symbol="BTC", 
+            broker=broker, 
+            strategy=strategy, 
+            feed=feed
+        )
+        
+        print("--- CHECKPOINT 6: Starting Loop ---")
+        # Run loop (check every 60 seconds)
+        engine.run_loop(interval_seconds=60)
+
+    except Exception as e:
+        print(f"\n🔥 CRITICAL CRASH: {e}")
+        import traceback
+        traceback.print_exc()
+        input("Press Enter to exit...") # Keeps window open so you can read the error
