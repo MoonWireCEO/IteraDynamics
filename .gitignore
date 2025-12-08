@@ -8,6 +8,8 @@ __pycache__/
 *_state.json
 paper_test.json
 *.log
+*.csv
+*.pkl
 
 # Cursor/VSCode settings
 .vscode/
