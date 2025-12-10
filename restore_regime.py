@@ -1,20 +1,18 @@
+import os
+import sys
+from pathlib import Path
+
+# 1. Define the content of the Regime Detector
+code_content = """
 import pandas as pd
 import numpy as np
-import time
 
 class MarketRegimeDetector:
     def __init__(self, volatility_window=20, trend_window=50):
         self.vol_window = volatility_window
         self.trend_window = trend_window
-        
-        # --- NEW: ANTI-FLICKER STATE ---
-        self.current_regime = "WARMUP"
-        self.last_switch_time = 0
-        self.MIN_REGIME_DURATION = 300  # 5 Minutes (Time Lock)
 
     def detect_regime(self, df):
-        # 1. CALCULATE RAW REGIME (Original Math)
-        # ---------------------------------------
         if len(df) < self.trend_window:
             return "WARMUP"
 
@@ -43,32 +41,7 @@ class MarketRegimeDetector:
         else:
             trend_state = "SIDEWAYS"
 
-        proposed_regime = f"{trend_state}_{vol_state}"
-
-        # 2. APPLY ANTI-FLICKER LOGIC
-        # ---------------------------
-        
-        # Case A: First valid regime (Initialization)
-        if self.current_regime == "WARMUP":
-            self.current_regime = proposed_regime
-            self.last_switch_time = time.time()
-            return proposed_regime
-
-        # Case B: Regime Change Proposed
-        if proposed_regime != self.current_regime:
-            # Check if we are inside the "Time Lock"
-            time_since_last_switch = time.time() - self.last_switch_time
-            
-            if time_since_last_switch < self.MIN_REGIME_DURATION:
-                # LOCKED: Ignore the new signal, return the old one
-                return self.current_regime
-            else:
-                # UNLOCKED: Commit the switch
-                print(f">> 🔄 REGIME SWITCH: {self.current_regime} -> {proposed_regime}")
-                self.current_regime = proposed_regime
-                self.last_switch_time = time.time()
-        
-        return self.current_regime
+        return f"{trend_state}_{vol_state}"
 
 class MetaStrategySelector:
     def get_strategy(self, regime):
@@ -89,3 +62,27 @@ class PositionSizer:
 
     def calculate_size(self, current_balance):
         return round(current_balance * self.risk_percent, 2)
+"""
+
+# 2. Determine target path (apex_core/regime_detector.py)
+target_path = Path("apex_core") / "regime_detector.py"
+
+# Ensure apex_core exists
+if not target_path.parent.exists():
+    print(f"❌ Error: {target_path.parent} does not exist.")
+    sys.exit(1)
+
+# 3. Write the file
+with open(target_path, "w", encoding="utf-8") as f:
+    f.write(code_content)
+
+print(f"✅ Successfully created: {target_path}")
+
+# 4. Verify Import
+sys.path.append(str(target_path.parent)) # Add apex_core to path
+try:
+    import regime_detector
+    print("✅ Verification: Import successful!")
+    print(f"   Classes found: {dir(regime_detector)}")
+except ImportError as e:
+    print(f"❌ Verification Failed: {e}")

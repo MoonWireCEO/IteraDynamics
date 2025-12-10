@@ -1,4 +1,6 @@
 import os
+
+content = r'''import os
 import joblib
 import pandas as pd
 import numpy as np
@@ -146,3 +148,13 @@ class MLStrategyAdapter:
             result["reason"] = f"Error: {str(e)}"
 
         return result
+'''
+
+target_file = "moonwire/strategies/ml_adapter.py"
+# Ensure directory exists
+os.makedirs(os.path.dirname(target_file), exist_ok=True)
+
+with open(target_file, "w", encoding="utf-8") as f:
+    f.write(content)
+
+print(f"✅ Successfully rewrote {target_file} with COLUMN TRANSLATOR.")

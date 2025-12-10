@@ -1,4 +1,11 @@
-# src/signal_generator.py
+import os
+import sys
+from pathlib import Path
+
+# ==============================================================================
+# 1. SIGNAL GENERATOR CONTENT (With Complete Signal Packets)
+# ==============================================================================
+generator_content = r'''# src/signal_generator.py
 from __future__ import annotations
 
 import os
@@ -8,8 +15,6 @@ import logging
 import pandas as pd
 import types
 import importlib.util
-import requests
-import time
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional, List
@@ -37,10 +42,9 @@ for file_path in current_dir.glob("*.py"):
                 sys.modules[module_name] = module 
                 spec.loader.exec_module(module)
                 setattr(src_pkg, module_name, module)
-        except Exception:
-            pass 
+        except Exception: pass 
 
-# --- IMPORTS (Fixed Syntax) ---
+# --- IMPORTS ---
 try: 
     from src.signal_filter import is_signal_valid
 except: 
@@ -79,16 +83,6 @@ except:
     SHADOW_LOG_PATH = Path("shadow_log.jsonl")
     GOVERNANCE_PARAMS_PATH = Path("governance_params.json")
 
-# --- BROKER IMPORT ---
-try:
-    from src.paper_broker import PaperBroker
-except ImportError:
-    try:
-        from paper_broker import PaperBroker
-    except:
-        logging.warning("PAPER BROKER NOT FOUND. Trading disabled.")
-        PaperBroker = None
-
 try:
     from src.regime_detector import MarketRegimeDetector, MetaStrategySelector, PositionSizer
 except ImportError:
@@ -125,7 +119,7 @@ def _read_json(path: Path, default: Any) -> Any:
     return default
 
 def load_governance_params(symbol: str) -> Dict[str, Any]:
-    default = {"conf_min": 0.55, "debounce_min": 5}
+    default = {"conf_min": 0.60, "debounce_min": 15}
     try: path = GOVERNANCE_PARAMS_PATH
     except NameError: path = Path("governance_params.json")
     data = _read_json(path, {})
@@ -135,28 +129,14 @@ def load_governance_params(symbol: str) -> Dict[str, Any]:
         "debounce_min": int(row.get("debounce_min", default["debounce_min"])),
     }
 
-def _fetch_live_coingecko_data(asset: str = "bitcoin") -> Dict[str, Any]:
+def _shadow_write(payload: Dict[str, Any]) -> None:
     try:
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        params = {
-            'ids': asset.lower(), 
-            'vs_currencies': 'usd',
-            'include_24hr_vol': 'true',
-            'include_24hr_change': 'true'
-        }
-        resp = requests.get(url, params=params, timeout=10)
-        data = resp.json()
-        
-        if asset.lower() in data:
-            d = data[asset.lower()]
-            return {
-                "price": float(d.get('usd', 0)),
-                "volume_24h": float(d.get('usd_24h_vol', 0)),
-                "price_change_24h": float(d.get('usd_24h_change', 0))
-            }
-    except Exception as e:
-        print(f"!! COINGECKO API ERROR: {e}")
-    return {}
+        payload = dict(payload)
+        if "ts" not in payload: payload["ts"] = _utcnow_iso()
+        try: path = SHADOW_LOG_PATH
+        except NameError: path = Path("shadow_log.jsonl")
+        atomic_jsonl_append(path, payload)
+    except Exception: pass
 
 def _fetch_asset_history(asset: str) -> Optional[pd.DataFrame]:
     try:
@@ -185,6 +165,7 @@ def _infer_ml(asset: str, strategy: str = None) -> Dict[str, Any]:
         if not isinstance(out, dict): return {"ok": False, "reason": "ml_bad_return_type"}
         if out.get("error"): return {"ok": False, "reason": f"ml_error:{out['error']}"}
         
+        # --- ROBUST KEY READING ---
         direction = out.get("direction") or out.get("dir")
         conf = out.get("confidence") if out.get("confidence") is not None else out.get("conf")
         
@@ -195,44 +176,26 @@ def _infer_ml(asset: str, strategy: str = None) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "reason": f"ml_exception:{type(e).__name__}"}
 
+def _heuristic_confidence(price_change: float, sentiment: float) -> float:
+    try: return float(max(0.0, min(1.0, ((price_change/10.0)+float(sentiment))/2.0)))
+    except: return 0.0
+
 def label_confidence(score: float) -> str:
     if score >= 0.66: return "High Confidence"
     elif score >= 0.33: return "Medium Confidence"
     else: return "Low Confidence"
 
-# --- PERSISTENT COOLDOWN CHECK ---
-def check_broker_cooldown(broker, minutes=10):
-    if not broker.trade_log:
-        return True
-    
-    last_trade = broker.trade_log[-1]
-    last_ts_str = str(last_trade.get("ts", ""))
-    try:
-        if "T" in last_ts_str:
-            last_dt = datetime.fromisoformat(last_ts_str)
-        else:
-            # Handle standard string conversion format
-            last_dt = datetime.strptime(last_ts_str, "%Y-%m-%d %H:%M:%S.%f")
-            
-        elapsed_min = (datetime.now() - last_dt).total_seconds() / 60
-        if elapsed_min < minutes:
-            return False
-    except:
-        return True
-    return True
-
-# --- SINGLETONS ---
 _regime_detector = MarketRegimeDetector()
 _strategy_selector = MetaStrategySelector()
-_broker = PaperBroker() if PaperBroker else None 
+_position_sizer = PositionSizer(risk_percent=0.10) 
 
 def generate_signals():
-    print(f"[{datetime.now().time()}] Starting Signal Generator (SMART SIZING + COOLDOWN)...")
+    print(f"[{datetime.now().time()}] Starting Signal Generator...")
     stablecoins = {"USDC", "USDT", "DAI", "TUSD", "BUSD"}
     valid_signals: List[dict] = []
     
-    live_env = os.getenv("MW_INFER_LIVE", "1")
-    live_ml = str(live_env).lower() in {"1", "true", "yes"}
+    shadow_only = str(os.getenv("MW_INFER_SHADOW_ONLY", "0")).lower() in {"1", "true", "yes"}
+    live_ml = str(os.getenv("MW_INFER_LIVE", "0")).lower() in {"1", "true", "yes"}
 
     try:
         assets = []
@@ -241,51 +204,37 @@ def generate_signals():
             except: pass 
         
         if not assets:
+            print(">> CACHE EMPTY. Switching to SIMULATION MODE (BTC).")
             assets = ["BTC"]
-        
+            class MockCache:
+                def get_signal(self, a): return {"price_change_24h": 2.5, "volume_now": 100000, "balance": 10000.0}
+            cache_obj = MockCache()
+        else:
+            cache_obj = cache
+
         sentiment_scores = blend_sentiment_scores() if 'blend_sentiment_scores' in globals() else {}
         
         for asset in assets:
             if asset in stablecoins: continue
+            data = cache_obj.get_signal(asset)
+            if not isinstance(data, dict): continue
+            price_change = data.get("price_change_24h", 0.0)
+            volume = data.get("volume_now", 0.0)
+            sentiment = float(sentiment_scores.get(asset, 0.0))
             
-            data = {}
-            if 'cache' in globals() and cache:
-                data = cache.get_signal(asset) or {}
-                
-            if not data.get("volume_now") or not data.get("price_change_24h"):
-                live_data = _fetch_live_coingecko_data("bitcoin" if asset == "BTC" else asset)
-                if live_data:
-                    data["volume_now"] = live_data["volume_24h"]
-                    data["price_change_24h"] = live_data["price_change_24h"]
-                    data["price"] = live_data["price"]
-                else:
-                    print(f"[{asset}] API Failed. Skipping.")
-                    continue
-
+            # 1. Regime & Strategy
             hist_df = _fetch_asset_history(asset)
             current_regime = _regime_detector.detect_regime(hist_df) if hist_df is not None and not hist_df.empty else "WARMUP"
             target_strategy = _strategy_selector.get_strategy(current_regime)
+            current_balance = float(data.get("balance", 10000.0)) 
+            trade_size_limit = _position_sizer.calculate_size(current_balance)
             
-            # --- GET REAL WALLET DATA ---
-            available_cash = 10000.0
-            current_pos_val = 0.0
-            total_equity = 10000.0
-            
-            if _broker:
-                available_cash = _broker.cash
-                current_price = float(data.get("price", 0.0))
-                current_pos_val = _broker.positions * current_price
-                total_equity = _broker.get_portfolio_value(current_price)
+            print(f"[{asset}] Regime: {current_regime} -> Strategy: {target_strategy} (Size: ${trade_size_limit})")
 
-            print(f"[{asset}] Regime: {current_regime} -> Strategy: {target_strategy}")
-
-            price_change = float(data.get("price_change_24h", 0.0))
-            volume = float(data.get("volume_now", 0.0))
-            current_price = float(data.get("price", 0.0))
-            sentiment = float(sentiment_scores.get(asset, 0.0))
-
+            # 2. Execution
             ml = _infer_ml(asset, strategy=target_strategy)
             
+            # --- DEBUG LOGGING ---
             if not ml.get("ok"):
                 print(f"   >> ML FAILED: {ml.get('reason')}")
             else:
@@ -294,11 +243,11 @@ def generate_signals():
 
             gov = load_governance_params(asset)
             
-            # --- DECIDE & EXECUTE ---
             if live_ml and ml.get("ok"):
                 direction = ml["dir"]
                 confidence = float(ml["conf"] or 0.0)
                 
+                # Check for HOLD
                 if direction is None:
                     print("   >> ML Decision: HOLD/CASH (No Signal Generated)")
                     continue
@@ -307,13 +256,6 @@ def generate_signals():
                     print(f"   >> ML Filtered: Confidence {confidence:.2f} < Min {gov['conf_min']}")
                     continue
                 
-                # --- SIZING LOGIC ---
-                exposure_pct = current_pos_val / total_equity if total_equity > 0 else 0
-                MAX_ALLOCATION = 0.99 
-                ENTRY_PERCENT_OF_CASH = 0.20
-                trade_dollars = available_cash * ENTRY_PERCENT_OF_CASH
-                MIN_TRADE_DOLLARS = 20.0 
-
                 signal = {
                     "asset": asset,
                     "direction": direction,
@@ -321,7 +263,8 @@ def generate_signals():
                     "confidence_label": label_confidence(confidence),
                     "regime": current_regime,            
                     "strategy": target_strategy,         
-                    "trade_size_limit": trade_dollars, 
+                    "trade_size_limit": trade_size_limit,
+                    # --- CRITICAL FIX: FULL PACKET ---
                     "price_change": price_change,
                     "volume": volume,
                     "sentiment": sentiment,
@@ -330,51 +273,16 @@ def generate_signals():
                     "inference": "ml_live"
                 }
                 
-                try:
-                    is_valid = is_signal_valid(signal)
-                except Exception as e:
-                    print(f"   >> CRITICAL: Signal Filter Crashed: {e}. Defaulting to True.")
-                    is_valid = True
-
-                if is_valid:
+                if is_signal_valid(signal):
                     dispatch_alerts(asset, signal, cache)
                     valid_signals.append(signal)
-                    print(f"   >> [LIVE SIGNAL GENERATED] {direction}")
-                    
-                    if _broker and current_price > 0:
-                        action = "BUY" if direction.lower() == "long" else "SELL"
-                        
-                        if action == "BUY":
-                            # CHECK COOLDOWN (10 mins)
-                            can_trade = check_broker_cooldown(_broker, minutes=10)
-                            
-                            if not can_trade:
-                                print(f"   >> [SKIPPED] Cooldown Active (Last trade < 10 mins ago)")
-                            elif exposure_pct >= MAX_ALLOCATION:
-                                print(f"   >> [SKIPPED] Max Allocation Reached ({exposure_pct*100:.1f}%)")
-                            elif trade_dollars < MIN_TRADE_DOLLARS:
-                                print(f"   >> [SKIPPED] Insufficient Cash for Min Trade (${available_cash:.2f})")
-                            else:
-                                qty = trade_dollars / current_price
-                                print(f"   >> [EXECUTING] {action} {qty:.6f} {asset} (${trade_dollars:.2f})")
-                                executed = _broker.execute_trade(action, qty, current_price)
-                                if executed:
-                                    equity = _broker.get_portfolio_value(current_price)
-                                    print(f"   >> [PORTFOLIO] Cash: ${round(_broker.cash, 2)} | Equity: ${round(equity, 2)}")
-                        
-                        elif action == "SELL":
-                            if _broker.positions > 0:
-                                qty = _broker.positions
-                                print(f"   >> [EXECUTING] {action} {qty:.6f} {asset} (CLOSE POSITION)")
-                                executed = _broker.execute_trade(action, qty, current_price)
-                                if executed:
-                                    equity = _broker.get_portfolio_value(current_price)
-                                    print(f"   >> [PORTFOLIO] Cash: ${round(_broker.cash, 2)} | Equity: ${round(equity, 2)}")
-                            else:
-                                print("   >> [SKIPPED] No position to sell.")
-
+                    print(f"   >> LIVE SIGNAL GENERATED: {direction}")
                 else:
-                    print(f"   >> [SIGNAL REJECTED] Filter Blocked (Vol: {volume}, Change: {price_change:.2f}%)")
+                    print(f"   >> SIGNAL REJECTED BY FILTER")
+            else:
+                confidence = _heuristic_confidence(price_change, sentiment)
+                direction = "long" if confidence >= 0.5 else "short"
+                print(f"   >> (Heuristic Backup): {direction} ({confidence:.2f})")
 
     except Exception as e:
         print(f"Generator Exception: {e}")
@@ -384,3 +292,9 @@ def generate_signals():
 if __name__ == "__main__":
     generate_signals()
     print("Signal Generation Complete.")
+'''
+
+# --- EXECUTE WRITES ---
+with open("apex_core/signal_generator.py", "w", encoding="utf-8") as f:
+    f.write(generator_content)
+print("✅ Updated signal_generator.py (Full Packets)")

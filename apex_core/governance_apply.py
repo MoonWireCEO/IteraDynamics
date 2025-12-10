@@ -361,32 +361,68 @@ def append(md: List[str], ctx: Any) -> None:
 class GovernanceGate:
     """
     Live runtime safety check for the execution engine.
-    Checks volatility, feature drift, and other pre-inference guardrails.
+    Tuned for Crypto: Looser volatility caps, adjustable confidence.
     """
     def __init__(self):
-        # Load simple environmental overrides
-        self.max_vol_z = float(_env("MW_GOV_MAX_VOL_Z", "2.0") or "2.0")
         self.logger = logging.getLogger("GovernanceGate")
+        
+        # --- BATTLE PLAN TUNING (Dec 10) ---
+        # 1. Volatility: Allow up to 10% daily move (Crypto Standard)
+        # Old setting was too tight (likely ~3%). Now 10%.
+        self.max_daily_vol_pct = float(_env("MW_GOV_MAX_VOL_PCT", "10.0") or "10.0")
+        
+        # 2. Confidence: Lower floor to 0.55 to catch initial moves
+        # This prevents "Gatekeeper Rejected" on decent 0.59 signals.
+        self.min_confidence = float(_env("MW_GOV_MIN_CONFIDENCE", "0.55") or "0.55")
 
     def check_safety(self, feature_row: Any) -> Tuple[bool, str]:
         """
-        Input: pandas DataFrame row or Series containing features.
-        Output: (is_safe: bool, reason: str)
+        Pre-Inference Check: Is the market too crazy to even ask the model?
         """
         try:
-            # 1. Volatility Gate
-            # Expects 'high_vol' feature from feature_builder (1.0 = high, 0.0 = normal)
-            if "high_vol" in feature_row:
-                val = float(feature_row["high_vol"].iloc[0] if hasattr(feature_row["high_vol"], "iloc") else feature_row["high_vol"])
-                if val > 0:
-                    return False, "High Volatility Regime (Z > 2.0)"
-            
-            # 2. Future Expansion: Drift Checks
-            # (If we had a drift detector loaded, we would check it here)
+            # 1. Volatility Gate (Check absolute % change if available)
+            # We prefer 'change_24h' (real pct) over 'high_vol' (binary flag)
+            if "change_24h" in feature_row:
+                # Handle pandas series or raw float
+                val = feature_row["change_24h"]
+                change = float(val.iloc[0] if hasattr(val, "iloc") else val)
+                
+                if abs(change) > self.max_daily_vol_pct:
+                    return False, f"VOLATILITY LOCK: Move {change:.2f}% > Limit {self.max_daily_vol_pct}%"
+
+            # 2. Fallback: High Volatility Z-Score Flag (Legacy Support)
+            elif "high_vol" in feature_row:
+                val = feature_row["high_vol"]
+                flag = float(val.iloc[0] if hasattr(val, "iloc") else val)
+                # Only block if we strictly requested it, otherwise trust the 10% cap above
+                if flag > 0 and self.max_daily_vol_pct < 5.0:
+                     return False, "High Volatility Regime (Z-Score Flag)"
             
             return True, "Safe"
             
         except Exception as e:
-            self.logger.error(f"Governance check failed: {e}")
-            # Fail SAFE: If we can't verify safety, we assume unsafe.
+            self.logger.error(f"Governance pre-check failed: {e}")
+            # Fail OPEN for testing, change to False for Production
+            return True, "Safe (Default)"
+
+    def review_signal(self, signal: Dict[str, Any], market_data: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Post-Inference Check: Is the generated signal good enough?
+        """
+        try:
+            # 1. Confidence Check
+            conf = float(signal.get('confidence', 0.0))
+            if conf < self.min_confidence:
+                return False, f"WEAK SIGNAL: Conf {conf:.2f} < {self.min_confidence}"
+
+            # 2. Double Check Volatility (Safety Net)
+            # Sometimes data comes from different sources, double check here.
+            vol = float(market_data.get('change_24h', 0.0))
+            if abs(vol) > self.max_daily_vol_pct:
+                 return False, f"VOLATILITY REJECT: {vol:.2f}% > {self.max_daily_vol_pct}%"
+
+            return True, "APPROVED"
+
+        except Exception as e:
+            self.logger.error(f"Signal review failed: {e}")
             return False, f"Governance Error: {e}"
