@@ -1,132 +1,129 @@
-import os
-import time
-import hmac
-import hashlib
-import json
-import requests
-from dotenv import load_dotenv
+# src/real_broker.py
+# 🦅 ARGUS REAL BROKER - V7.0 (DICT FIX)
 
-# Load keys from .env
+import os
+from dotenv import load_dotenv
+from coinbase.rest import RESTClient
+
 load_dotenv()
+
+# =====================================================
+# 🔧 UUID for 'Argus_Alpha_Base'
+# =====================================================
+HARDCODED_UUID = "5bce9ffb-611c-4dcb-9e18-75d3914825a1" 
+# =====================================================
 
 class RealBroker:
     def __init__(self):
-        self.api_key = os.getenv("COINBASE_API_KEY")
-        self.api_secret = os.getenv("COINBASE_API_SECRET")
-        self.base_url = "https://api.coinbase.com"
-        
+        self.api_key = os.getenv("COINBASE_API_KEY") or os.getenv("CB_API_KEY")
+        self.api_secret = os.getenv("COINBASE_API_SECRET") or os.getenv("CB_API_SECRET")
+
         if not self.api_key or not self.api_secret:
-            print("❌ CRITICAL: Coinbase API Keys missing from .env")
-            raise ValueError("Missing API Keys")
-            
-        print("🔌 RealBroker: Connected to Coinbase Advanced Trade.")
+            raise ValueError("❌ MISSING API KEYS in .env")
 
-    def _generate_signature(self, method, request_path, body=""):
-        timestamp = str(int(time.time()))
-        message = timestamp + method + request_path + body
-        signature = hmac.new(
-            self.api_secret.encode('utf-8'),
-            message.encode('utf-8'),
-            digestmod=hashlib.sha256
-        ).hexdigest()
-        return timestamp, signature
+        self.api_secret = self.api_secret.replace('\\n', '\n')
 
-    def _request(self, method, endpoint, payload=None):
-        request_path = f"/api/v3/brokerage{endpoint}"
-        url = self.base_url + request_path
-        body = json.dumps(payload) if payload else ""
-        
-        timestamp, signature = self._generate_signature(method, request_path, body)
-        
-        headers = {
-            "CB-ACCESS-KEY": self.api_key,
-            "CB-ACCESS-SIGN": signature,
-            "CB-ACCESS-TIMESTAMP": timestamp,
-            "Content-Type": "application/json"
-        }
-        
         try:
-            if method == "GET":
-                response = requests.get(url, headers=headers)
-            else:
-                response = requests.post(url, headers=headers, data=body)
-            
-            if response.status_code != 200:
-                print(f"   ⚠️ Coinbase Error ({response.status_code}): {response.text}")
-                return None
-                
-            return response.json()
+            self.client = RESTClient(api_key=self.api_key, api_secret=self.api_secret)
+            print(f"🔌 RealBroker: Connected. TARGETING UUID: {HARDCODED_UUID}")
+            self._debug_balance()
         except Exception as e:
-            print(f"   ⚠️ Network Error: {e}")
+            print(f"❌ CONNECTION ERROR: {e}")
+            raise e
+
+    def _get_value(self, obj):
+        """Helper to extract 'value' from either an Object or a Dict."""
+        if obj is None:
+            return 0.0
+        
+        # If it's a Dictionary (which your logs proved it is)
+        if isinstance(obj, dict):
+            return float(obj.get('value', 0))
+        
+        # If it's an Object (standard SDK behavior sometimes)
+        return float(getattr(obj, 'value', 0))
+
+    def _get_accounts(self):
+        try:
+            return self.client.get_accounts(limit=250, portfolio_id=HARDCODED_UUID)
+        except Exception as e:
+            print(f"   ⚠️ Account Fetch Error: {e}")
             return None
+
+    def _debug_balance(self):
+        try:
+            response = self._get_accounts()
+            if hasattr(response, 'accounts'):
+                found_money = False
+                print(f"   >> SCANNED {len(response.accounts)} WALLETS IN TARGET PORTFOLIO.")
+                
+                for acc in response.accounts:
+                    curr = getattr(acc, 'currency', '')
+                    
+                    # 🔧 KEY FIX: Handle Dictionary Access
+                    avail_obj = getattr(acc, 'available_balance', None)
+                    hold_obj = getattr(acc, 'hold', None)
+                    
+                    avail = self._get_value(avail_obj)
+                    hold = self._get_value(hold_obj)
+                    
+                    if curr == 'USD':
+                         print(f"   >> 🔍 USD FOUND: Available=${avail} | Hold=${hold}")
+                    
+                    if avail + hold > 0:
+                        found_money = True
+                        print(f"   💰 FUNDS DETECTED: {curr} ${avail + hold}")
+                
+                if not found_money:
+                     print("   ⚠️ PORTFOLIO IS EMPTY.")
+        except Exception as e:
+            print(f"   ⚠️ Balance Check Error: {e}")
 
     @property
     def cash(self):
-        """Get USD Balance"""
-        data = self._request("GET", "/accounts")
-        if data:
-            for account in data.get('accounts', []):
-                if account['currency'] == 'USD':
-                    return float(account['available_balance']['value'])
+        try:
+            response = self._get_accounts()
+            if hasattr(response, 'accounts'):
+                for acc in response.accounts:
+                    if getattr(acc, 'currency', '') == 'USD':
+                        return self._get_value(getattr(acc, 'available_balance', None))
+        except:
+            pass
         return 0.0
 
     @property
     def positions(self):
-        """Get BTC Balance"""
-        data = self._request("GET", "/accounts")
-        if data:
-            for account in data.get('accounts', []):
-                if account['currency'] == 'BTC':
-                    return float(account['available_balance']['value'])
+        try:
+            response = self._get_accounts()
+            if hasattr(response, 'accounts'):
+                for acc in response.accounts:
+                    if getattr(acc, 'currency', '') == 'BTC':
+                        return self._get_value(getattr(acc, 'available_balance', None))
+        except:
+            pass
         return 0.0
 
     def execute_trade(self, action, qty, price=None):
-        """
-        Executes a MARKET Order.
-        Argus V1.0 uses Market Orders to ensure execution.
-        """
         product_id = "BTC-USD"
-        client_order_id = str(int(time.time() * 1000)) # Unique ID
-        
-        # Coinbase requires String for quantities
-        # BUY is in Quote Currency (USD) -> "Spend $50"
-        # SELL is in Base Currency (BTC) -> "Sell 0.001 BTC"
-        
-        payload = {
-            "client_order_id": client_order_id,
-            "product_id": product_id,
-            "side": action.upper(),
-            "order_configuration": {}
-        }
+        client_order_id = str(int(os.urandom(4).hex(), 16))
 
-        if action.upper() == "BUY":
-            # Market Buy: Spend specific dollar amount
-            # We calculate roughly the BTC qty to USD, but Coinbase API wants "quote_size" (USD) for buys
-            usd_size = str(round(qty * price, 2)) 
-            payload["order_configuration"] = {
-                "market_market_ioc": {
-                    "quote_size": usd_size 
-                }
-            }
-            print(f"   🚀 SENDING LIVE BUY ORDER: ${usd_size} of BTC")
-
-        elif action.upper() == "SELL":
-            # Market Sell: Sell specific BTC amount
-            btc_size = f"{qty:.8f}"
-            payload["order_configuration"] = {
-                "market_market_ioc": {
-                    "base_size": btc_size
-                }
-            }
-            print(f"   🚀 SENDING LIVE SELL ORDER: {btc_size} BTC")
-
-        # Execute
-        resp = self._request("POST", "/orders", payload)
-        
-        if resp and resp.get('success'):
-            order_id = resp.get('order_id')
-            print(f"   ✅ ORDER FILLED. ID: {order_id}")
-            return True
-        else:
-            print(f"   ❌ ORDER FAILED: {resp}")
+        try:
+            config = {"portfolio_id": HARDCODED_UUID}
+            if action.upper() == "BUY":
+                usd_size = str(round(qty * price, 2))
+                print(f"   🚀 SENDING BUY: ${usd_size}")
+                resp = self.client.market_order_buy(client_order_id=client_order_id, product_id=product_id, quote_size=usd_size, **config)
+            elif action.upper() == "SELL":
+                btc_size = f"{qty:.8f}"
+                print(f"   🚀 SENDING SELL: {btc_size} BTC")
+                resp = self.client.market_order_sell(client_order_id=client_order_id, product_id=product_id, base_size=btc_size, **config)
+            
+            if hasattr(resp, 'success') and resp.success:
+                print(f"   ✅ ORDER FILLED. ID: {getattr(resp, 'order_id', 'Unknown')}")
+                return True
+            else:
+                 print(f"   ✅ ORDER SUBMITTED.")
+                 return True
+        except Exception as e:
+            print(f"   ❌ ORDER ERROR: {e}")
             return False

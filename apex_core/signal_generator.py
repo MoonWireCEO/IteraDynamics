@@ -1,206 +1,163 @@
-# src/signal_generator.py
-# V1.0 PRODUCTION - DIRECT MODEL LOADING
+# apex_core/signal_generator.py
+# 🦅 ARGUS LIVE PILOT - V1.2 (SYNCED WITH REAL BROKER)
 
 from __future__ import annotations
 import sys
-if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding='utf-8')
-
 import os
-import json
-import logging
+import joblib
 import pandas as pd
 import pandas_ta as ta
-import numpy as np
-import joblib
 import requests
 import time
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List
+from datetime import datetime
+from dotenv import load_dotenv # Added to ensure env is loaded
+
+# --- 🔧 CRITICAL PATH FIX ---
+current_file = Path(__file__).resolve()
+project_root = current_file.parent.parent # apex_core -> IteraDynamics_Mono
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+# Load Env (Redundant safety)
+load_dotenv(project_root / ".env")
 
 # --- CONFIGURATION ---
-MODELS_DIR = Path("moonwire/models")
-MODEL_FILE = "random_forest.pkl" # The V1.0 Survivor
-GOVERNANCE_PARAMS_PATH = Path("governance_params.json")
+MODELS_DIR = project_root / "moonwire/models"
+MODEL_FILE = "random_forest.pkl"
+DATA_FILE = project_root / "flight_recorder.csv"
 
-# --- BROKER IMPORT ---
+# --- ⚠️ LIVE BROKER IMPORT ⚠️ ---
 try:
-    from src.paper_broker import PaperBroker
-except ImportError:
-    try:
-        from paper_broker import PaperBroker
-    except:
-        print("⚠️ PAPER BROKER NOT FOUND. Trading disabled.")
-        PaperBroker = None
+    from src.real_broker import RealBroker
+except ImportError as e:
+    print(f"❌ CRITICAL IMPORT ERROR: {e}")
+    sys.exit(1)
 
-# --- SINGLETON BROKER ---
-_broker = PaperBroker() if PaperBroker else None 
+# Connect to API
+try:
+    print("   >> 🦅 CONNECTING TO LIVE COINBASE API...")
+    _broker = RealBroker() 
+except Exception as e:
+    print(f"❌ CRITICAL: Broker Connection Failed: {e}")
+    sys.exit(1)
 
-def update_market_data(csv_path: Path = Path("flight_recorder.csv")):
-    """
-    Fetches the latest completed 1H candle from Coinbase and appends it to the CSV.
-    """
+
+def update_market_data(csv_path: Path = DATA_FILE):
+    """ Fetches latest candle from Coinbase to keep the CSV alive. """
     try:
-        print("   >> Updating Market Data (Coinbase)...")
         url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
         params = {'granularity': 3600} # 1 Hour
         resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
-        
-        # Coinbase returns [time, low, high, open, close, volume]
-        # Reverse to get oldest first
         data.sort(key=lambda x: x[0]) 
         
+        # Simple CSV Append Logic
         if not csv_path.exists():
-            print("   >> CSV missing. Cannot append.")
-            return
+            print("   >> ⚠️ Flight Recorder missing. Creating new...")
+            pd.DataFrame(columns=["Timestamp","Open","High","Low","Close","Volume"]).to_csv(csv_path, index=False)
 
         df = pd.read_csv(csv_path)
-        last_timestamp = pd.to_datetime(df['Timestamp'], format='mixed').max()
+        if not df.empty:
+            last_ts = pd.to_datetime(df['Timestamp']).max()
+        else:
+            last_ts = datetime.min
         
         new_rows = []
         for candle in data:
             ts = datetime.fromtimestamp(candle[0])
-            if ts > last_timestamp:
+            if ts > last_ts:
                 new_rows.append({
                     'Timestamp': ts.strftime('%Y-%m-%d %H:%M:%S'),
-                    'Open': candle[3],
-                    'High': candle[2],
-                    'Low': candle[1],
-                    'Close': candle[4],
-                    'Volume': candle[5]
+                    'Open': candle[3], 'High': candle[2], 'Low': candle[1], 'Close': candle[4], 'Volume': candle[5]
                 })
         
         if new_rows:
-            new_df = pd.DataFrame(new_rows)
-            new_df.to_csv(csv_path, mode='a', header=False, index=False)
-            print(f"   >> ✅ Added {len(new_rows)} new hourly candle(s). Latest: {new_rows[-1]['Timestamp']}")
-        else:
-            print("   >> Data is up to date.")
-
+            pd.DataFrame(new_rows).to_csv(csv_path, mode='a', header=False, index=False)
+            print(f"   >> ✅ Market Data Updated. Newest: {new_rows[-1]['Timestamp']}")
     except Exception as e:
-        print(f"   >> ⚠️ Data Update Failed: {e}")
+        print(f"   >> ⚠️ Data Update Glitch: {e}")
 
-def get_latest_features(csv_path: Path = Path("flight_recorder.csv")):
-    """
-    Recreates the exact V1.0 Feature Engineering from the backtest.
-    """
+def get_latest_features(csv_path: Path = DATA_FILE):
     try:
         df = pd.read_csv(csv_path)
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'], format='mixed')
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
         df.sort_values('Timestamp', inplace=True)
         
-        # --- FEATURE ENGINEERING (Must match train_real_models.py) ---
-        df['RSI'] = ta.rsi(df['Price'], length=14)
-        bband = ta.bbands(df['Price'], length=20, std=2)
+        # Feature Engineering (V1.0 Standard)
+        df['RSI'] = ta.rsi(df['Close'], length=14)
+        bband = ta.bbands(df['Close'], length=20, std=2)
         
-        # Handle BB names which can vary
+        # Safe BB Column Access
         lower_col = next(c for c in bband.columns if c.startswith("BBL"))
         upper_col = next(c for c in bband.columns if c.startswith("BBU"))
         
-        df['BB_Pos'] = (df['Price'] - bband[lower_col]) / (bband[upper_col] - bband[lower_col])
+        df['BB_Pos'] = (df['Close'] - bband[lower_col]) / (bband[upper_col] - bband[lower_col])
         df['Vol_Z'] = (df['Volume'] - df['Volume'].rolling(20).mean()) / df['Volume'].rolling(20).std()
         
-        # Get the very last row (the most recent closed candle)
-        last_row = df.iloc[-1]
-        
-        features = pd.DataFrame([[last_row['RSI'], last_row['BB_Pos'], last_row['Vol_Z']]], 
-                                columns=['RSI', 'BB_Pos', 'Vol_Z'])
-        
-        market_data = {
-            "price": last_row['Price'],
-            "volume": last_row['Volume'],
-            "timestamp": last_row['Timestamp']
-        }
-        
-        return features, market_data
-        
-    except Exception as e:
-        print(f"   >> Feature Engineering Failed: {e}")
+        last = df.iloc[-1]
+        # Return Dataframe for model, and Float for price
+        return pd.DataFrame([[last['RSI'], last['BB_Pos'], last['Vol_Z']]], columns=['RSI', 'BB_Pos', 'Vol_Z']), last['Close']
+    except:
         return None, None
 
 def generate_signals():
-    print(f"[{datetime.now().time()}] Starting Signal Generator (V1.0 PRODUCTION)...")
+    print(f"[{datetime.now().time()}] 🦅 ARGUS LIVE EXECUTION CYCLE...")
     
-    # 1. Update Data
+    # 1. Update & Load
     update_market_data()
+    try:
+        model = joblib.load(MODELS_DIR / MODEL_FILE)
+    except FileNotFoundError:
+        print(f"❌ Model not found at {MODELS_DIR / MODEL_FILE}")
+        return
+
+    features, price = get_latest_features()
     
-    # 2. Load Model
-    model_path = MODELS_DIR / MODEL_FILE
-    if not model_path.exists():
-        print(f"   >> ❌ CRITICAL: Model file not found at {model_path}")
-        return
-        
-    try:
-        model = joblib.load(model_path)
-        print(f"   >> Loaded {MODEL_FILE}")
-    except Exception as e:
-        print(f"   >> ❌ Model Load Failed: {e}")
-        return
-
-    # 3. Get Features (The Brain Input)
-    features, market_data = get_latest_features()
     if features is None:
-        print("   >> ❌ No features available. Aborting.")
+        print("   >> ❌ No Data. Skipping.")
         return
 
-    # 4. Predict (The Brain Output)
+    # 2. Predict
+    prediction = model.predict(features)[0]
+    signal = "BUY" if prediction == 1 else "SELL"
+    print(f"   >> [BRAIN] Signal: {signal} (Price: ${price:,.2f})")
+
+    # 3. LIVE EXECUTION
     try:
-        prediction = model.predict(features)[0]
-        # In random_forest.pkl, 1 = UP (Buy), 0 = DOWN (Sell/Cash)
-        signal_str = "BUY" if prediction == 1 else "SELL"
-        print(f"   >> [BRAIN] Prediction: {signal_str} (Price: ${market_data['price']:,.2f})")
-    except Exception as e:
-        print(f"   >> ❌ Prediction Failed: {e}")
-        return
+        # --- FIXED METHOD CALLS ---
+        cash = _broker.cash         # Using property instead of get_cash_balance()
+        position = _broker.positions # Using property instead of get_position_size()
+        
+        print(f"   >> [WALLET] Cash: ${cash:.2f} | BTC: {position:.6f}")
+        
+        # --- CIRCUIT BREAKER ---
+        # If account value drops below $85, KILL SWITCH.
+        est_value = cash + (position * price)
+        if est_value < 85.00:
+            print("   >> 🛑 CRITICAL: Account Value < $85. Trading Halted.")
+            return
 
-    # 5. Execute (The Hands)
-    if _broker:
-        asset = "BTC"
-        cash = _broker.cash
-        price = market_data['price']
-        
-        # CONFIG: V1.0 Sizing (50% Risk)
-        RISK_PER_TRADE = 0.50 
-        MIN_TRADE_DOLLARS = 20.0
-        
-        # Check Cooldown (10 mins to prevent double-fire in same hour)
-        # In a real hourly loop, this acts as a debounce
-        last_trade_ts = _broker.trade_log[-1].get('ts') if _broker.trade_log else None
-        cooldown_active = False
-        if last_trade_ts:
-            last_dt = datetime.fromisoformat(str(last_trade_ts))
-            if (datetime.now() - last_dt).total_seconds() < 600: # 10 mins
-                cooldown_active = True
-        
-        if cooldown_active:
-             print(f"   >> [SKIPPED] Cooldown Active (Already traded this hour)")
-             return
-
-        # EXECUTION LOGIC
-        if signal_str == "BUY":
-            # Only buy if we have cash and no position (or adding to position)
-            # For V1.0 simplicity: If we have cash, deploy 50% of it.
-            if cash > MIN_TRADE_DOLLARS:
-                trade_amt = cash * RISK_PER_TRADE
-                qty = trade_amt / price
-                print(f"   >> [EXECUTING] BUY {qty:.6f} BTC (${trade_amt:.2f})")
+        if signal == "BUY":
+            investable_cash = cash - 2.0 
+            if investable_cash > 10.0: 
+                qty = investable_cash / price
+                print(f"   >> 🦅 ROUTING ORDER: BUY {qty:.6f} BTC (~${investable_cash:.2f})")
+                # Using execute_trade(action, qty, price)
                 _broker.execute_trade("BUY", qty, price)
             else:
-                print("   >> [HOLD] Signal is BUY, but insufficient cash (Fully Invested?)")
+                print("   >> [HOLD] BUY Signal, but Insufficient Cash.")
 
-        elif signal_str == "SELL":
-            # Sell everything
-            if _broker.positions > 0:
-                print(f"   >> [EXECUTING] SELL {_broker.positions:.6f} BTC (Closing Position)")
-                _broker.execute_trade("SELL", _broker.positions, price)
+        elif signal == "SELL":
+            if (position * price) > 5.0:
+                print(f"   >> 🦅 ROUTING ORDER: SELL {position:.6f} BTC")
+                # Using execute_trade(action, qty, price)
+                _broker.execute_trade("SELL", position, price)
             else:
-                print("   >> [HOLD] Signal is SELL, but no position to close (Already in Cash)")
-        
-        # Report
-        val = _broker.get_portfolio_value(price)
-        print(f"   >> [PORTFOLIO] Cash: ${_broker.cash:,.2f} | Equity: ${val:,.2f}")
+                print("   >> [HOLD] SELL Signal, but no BTC to sell.")
+                
+    except Exception as e:
+        print(f"   >> ❌ EXECUTION ERROR: {e}")
 
 if __name__ == "__main__":
     generate_signals()
