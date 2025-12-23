@@ -1,5 +1,5 @@
-# apex_core/signal_generator.py
-# 🦅 ARGUS LIVE PILOT - V3.3 (TZ-AWARE UTC + DECISION LOGGING + FAIL POLICIES + ATOMIC ARTIFACTS)
+# runtime/argus/apex_core/signal_generator.py
+# 🦅 ARGUS LIVE PILOT - V3.4 (RUNTIME LAYOUT COMPAT)
 
 from __future__ import annotations
 
@@ -15,19 +15,46 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
-# --- 🔧 PATH CONFIGURATION ---
+# ---------------------------
+# Path / env resolution (runtime/argus as root)
+# ---------------------------
+
 current_file = Path(__file__).resolve()
-project_root = current_file.parent.parent
+project_root = current_file.parent.parent  # .../runtime/argus
+
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-load_dotenv(project_root / ".env")
 
-MODELS_DIR = project_root / "moonwire/models"
-MODEL_FILE = "random_forest.pkl"
+def _find_env_file(start: Path) -> Path | None:
+    """
+    Find the first .env walking up from `start` through parents.
+    This avoids brittle assumptions about where .env lives (repo root vs runtime root).
+    """
+    for p in (start, *start.parents):
+        candidate = p / ".env"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+_env = _find_env_file(project_root)
+if _env is not None:
+    load_dotenv(_env)
+else:
+    # Still allow environment-only execution.
+    load_dotenv()
+
+# ---------------------------
+# Runtime assets / artifacts
+# ---------------------------
+
+MODELS_DIR = project_root / "models"
+MODEL_FILE = os.getenv("ARGUS_MODEL_FILE", "random_forest.pkl")
+
 DATA_FILE = project_root / "flight_recorder.csv"
-
 STATE_FILE = project_root / "trade_state.json"
+
 CORTEX_FILE = project_root / "cortex.json"
 CORTEX_TMP = project_root / "cortex.json.tmp"
 
@@ -36,13 +63,17 @@ PRODUCT_ID = "BTC-USD"
 # Policy thresholds (env-overridable)
 MIN_NOTIONAL_USD = float(os.getenv("ARGUS_MIN_NOTIONAL_USD", "5.0"))
 MIN_HOLD_HOURS = float(os.getenv("ARGUS_MIN_HOLD_HOURS", "4.0"))
+
 # Slippage-aware cushion via hurdle (default 0.35%).
 PROFIT_HURDLE_PCT = float(os.getenv("ARGUS_PROFIT_HURDLE_PCT", "0.0035"))
+
 # Emergency exit threshold (severity in [0, 1]).
 EMERGENCY_SEVERITY_THRESHOLD = float(os.getenv("ARGUS_EMERGENCY_SEVERITY_THRESHOLD", "0.85"))
 
+# ---------------------------
+# Broker import
+# ---------------------------
 
-# --- ⚠️ BROKER IMPORT ---
 try:
     from src.real_broker import RealBroker
 except ImportError as e:
@@ -66,12 +97,13 @@ def _atomic_write_json(path: Path, tmp: Path, payload: dict) -> None:
 
 
 def update_market_data():
-    """Fetch latest candles (UTC) and append only new rows. Ensures header on first creation."""
+    """Fetch latest hourly candles (UTC) and append only new rows."""
     try:
         url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
         resp = requests.get(url, params={"granularity": 3600}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
+
         if not isinstance(data, list):
             raise ValueError(f"Unexpected candles payload type: {type(data)}")
 
@@ -180,6 +212,7 @@ def _load_trade_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
+
         if not isinstance(state, dict):
             return None, "CORRUPT"
         if "entry_timestamp" not in state or "entry_price" not in state:
@@ -187,11 +220,10 @@ def _load_trade_state():
 
         entry_time = datetime.fromisoformat(state["entry_timestamp"])
         if entry_time.tzinfo is None:
-            # Backward compatibility for older naive timestamps: treat as UTC.
+            # Backward compat for older naive timestamps: treat as UTC.
             entry_time = entry_time.replace(tzinfo=timezone.utc)
 
         float(state["entry_price"])
-        # Store normalized timestamp object for downstream use
         state["_entry_time"] = entry_time
         return state, "OK"
     except Exception:
@@ -208,7 +240,8 @@ def generate_signals():
     # Model + data load (BUY fail-closed)
     # ---------------------------
     try:
-        model = joblib.load(MODELS_DIR / MODEL_FILE)
+        model_path = MODELS_DIR / MODEL_FILE
+        model = joblib.load(model_path)
         df = pd.read_csv(DATA_FILE)
     except Exception as e:
         print(f"   >> [DECISION] HOLD | Reason: MODEL_OR_DATA_LOAD_FAIL | Error: {e}")
@@ -284,7 +317,7 @@ def generate_signals():
     else:
         print(f"   >> [WALLET] UNVERIFIED | Error: {wallet_err}")
 
-    # Write dashboard artifact atomically (do not depend on wallet)
+    # Write dashboard artifact atomically
     try:
         _atomic_write_json(
             CORTEX_FILE,
@@ -300,6 +333,8 @@ def generate_signals():
                 "btc": float(btc) if wallet_verified else None,
                 "btc_notional_usd": float(btc_notional) if wallet_verified else None,
                 "emergency_exit": bool(emergency_exit),
+                "model_file": str(MODEL_FILE),
+                "model_path": str(model_path),
             },
         )
     except Exception as e:
