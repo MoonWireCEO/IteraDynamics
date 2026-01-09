@@ -1,5 +1,12 @@
-# runtime/argus/apex_core/signal_generator.py
-# 🦅 ARGUS LIVE PILOT - V3.5 (SMARTER DISCRETE DECISION LOGIC)
+# /opt/argus/apex_core/signal_generator.py
+# 🦅 ARGUS LIVE PILOT - V3.6 (V3.5 + PROVENANCE + SAFE ENV LOADING)
+#
+# FULL FILE REPLACEMENT (SOP)
+#
+# Key fixes vs your current server copy:
+# - Safe .env loading: never override systemd EnvironmentFile values
+# - Provenance logging: prints which file is running + key paths/config once per process
+# - No functional strategy changes vs V3.5 (guardrails + regime gating unchanged)
 
 from __future__ import annotations
 
@@ -12,16 +19,17 @@ import pandas as pd
 import pandas_ta as ta
 
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # ---------------------------
-# Path / env resolution (runtime/argus as root)
+# Path / env resolution (/opt/argus as project root)
 # ---------------------------
 
 current_file = Path(__file__).resolve()
-project_root = current_file.parent.parent  # .../runtime/argus
+project_root = current_file.parent.parent  # /opt/argus
 
+# Ensure local project wins imports
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
@@ -29,7 +37,7 @@ if str(project_root) not in sys.path:
 def _find_env_file(start: Path) -> Path | None:
     """
     Find the first .env walking up from `start` through parents.
-    This avoids brittle assumptions about where .env lives (repo root vs runtime root).
+    This avoids brittle assumptions about where .env lives.
     """
     for p in (start, *start.parents):
         candidate = p / ".env"
@@ -38,12 +46,12 @@ def _find_env_file(start: Path) -> Path | None:
     return None
 
 
+# Load .env best-effort, but NEVER override systemd EnvironmentFile vars.
 _env = _find_env_file(project_root)
 if _env is not None:
-    load_dotenv(_env)
+    load_dotenv(_env, override=False)
 else:
-    # Still allow environment-only execution.
-    load_dotenv()
+    load_dotenv(override=False)
 
 # ---------------------------
 # Runtime assets / artifacts
@@ -70,17 +78,10 @@ PROFIT_HURDLE_PCT = float(os.getenv("ARGUS_PROFIT_HURDLE_PCT", "0.0035"))
 # Emergency exit threshold (severity in [0, 1]).
 EMERGENCY_SEVERITY_THRESHOLD = float(os.getenv("ARGUS_EMERGENCY_SEVERITY_THRESHOLD", "0.85"))
 
-# --- NEW: discrete decision tuning knobs ---
-# Hard stop-loss to cap downside on a single trade (e.g. 0.02 = -2%)
-STOP_LOSS_PCT = float(os.getenv("ARGUS_STOP_LOSS_PCT", "0.02"))
-
-# Hard max-hold to avoid zombie positions that never quite hit hurdle (in hours)
-MAX_HOLD_HOURS = float(os.getenv("ARGUS_MAX_HOLD_HOURS", "72.0"))
-
-# If severity exceeds this, we relax profit hurdle a bit to exit sooner
+# Discrete decision tuning knobs
+STOP_LOSS_PCT = float(os.getenv("ARGUS_STOP_LOSS_PCT", "0.02"))          # e.g. 0.02 = -2%
+MAX_HOLD_HOURS = float(os.getenv("ARGUS_MAX_HOLD_HOURS", "72.0"))        # e.g. 72h
 HURDLE_RELIEF_SEVERITY = float(os.getenv("ARGUS_HURDLE_RELIEF_SEVERITY", "0.60"))
-
-# Factor to shrink hurdle when in bad regimes / high severity (e.g. 0.5 = cut in half)
 HURDLE_RELIEF_FACTOR = float(os.getenv("ARGUS_HURDLE_RELIEF_FACTOR", "0.5"))
 
 # ---------------------------
@@ -94,6 +95,9 @@ except ImportError as e:
     sys.exit(1)
 
 _broker = RealBroker()
+
+# Print provenance once per process (not every cycle)
+_PROVENANCE_PRINTED = False
 
 
 def _utc_ts() -> str:
@@ -109,7 +113,7 @@ def _atomic_write_json(path: Path, tmp: Path, payload: dict) -> None:
     os.replace(tmp, path)
 
 
-def update_market_data():
+def update_market_data() -> None:
     """Fetch latest hourly candles (UTC) and append only new rows."""
     try:
         url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
@@ -130,12 +134,10 @@ def update_market_data():
             if pd.isna(last_ts):
                 last_ts = pd.Timestamp.min.tz_localize("UTC")
         else:
-            pd.DataFrame(columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]).to_csv(
-                DATA_FILE, index=False
-            )
+            pd.DataFrame(columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]).to_csv(DATA_FILE, index=False)
             last_ts = pd.Timestamp.min.tz_localize("UTC")
 
-        new_rows = []
+        new_rows: list[dict] = []
         for c in data:
             # Coinbase candles: [ time, low, high, open, close, volume ]
             ts = pd.to_datetime(c[0], unit="s", utc=True)
@@ -245,8 +247,24 @@ def _load_trade_state():
         return None, "CORRUPT"
 
 
-def generate_signals():
+def generate_signals() -> None:
+    global _PROVENANCE_PRINTED
+
     cycle_start = _utc_ts()
+
+    # Provenance once (makes it undeniable what code is executing)
+    if not _PROVENANCE_PRINTED:
+        try:
+            print("   >> [PROVENANCE] signal_generator loaded from:", str(current_file))
+            print("   >> [PROVENANCE] project_root:", str(project_root))
+            print("   >> [PROVENANCE] MODELS_DIR:", str(MODELS_DIR))
+            print("   >> [PROVENANCE] MODEL_FILE:", str(MODEL_FILE))
+            print("   >> [PROVENANCE] DATA_FILE:", str(DATA_FILE))
+            print("   >> [PROVENANCE] STATE_FILE:", str(STATE_FILE))
+            print("   >> [PROVENANCE] PRODUCT_ID:", str(PRODUCT_ID))
+        except Exception:
+            pass
+        _PROVENANCE_PRINTED = True
 
     update_market_data()
 
@@ -367,7 +385,7 @@ def generate_signals():
             print(f"   >> [DECISION] HOLD | Reason: RISK_MULT_ZERO | Regime: {regime}")
             return
 
-        # 🛡️ Option A: disable pyramiding while already in a position
+        # Disable pyramiding while already in a position
         if btc_notional >= MIN_NOTIONAL_USD:
             print(
                 f"   >> [DECISION] HOLD | Reason: ALREADY_IN_POSITION_NO_PYRAMID | "
@@ -425,7 +443,7 @@ def generate_signals():
         hold_hours = hold_time.total_seconds() / 3600.0
         profit_pct = (price - entry_price) / entry_price
 
-        # --- 1) Hard stop-loss: dominates all other guardrails ---
+        # 1) Hard stop-loss: dominates all other guardrails
         if profit_pct <= -STOP_LOSS_PCT:
             print(
                 f"   >> [EXECUTION] ROUTE SELL | Reason: STOP_LOSS_TRIGGERED | Loss: {profit_pct:.3%} | "
@@ -434,7 +452,7 @@ def generate_signals():
             _broker.execute_trade("SELL", btc, price)
             return
 
-        # --- 2) Max-hold failsafe to avoid zombie positions ---
+        # 2) Max-hold failsafe to avoid zombie positions
         if hold_hours >= MAX_HOLD_HOURS:
             print(
                 f"   >> [EXECUTION] ROUTE SELL | Reason: MAX_HOLD_EXCEEDED | Held: {hold_hours:.2f}h | "
@@ -443,7 +461,7 @@ def generate_signals():
             _broker.execute_trade("SELL", btc, price)
             return
 
-        # --- 3) Min-hold: only block sells before MIN_HOLD_HOURS unless stop-loss already triggered ---
+        # 3) Min-hold: only block sells before MIN_HOLD_HOURS unless stop-loss already triggered
         if hold_hours < MIN_HOLD_HOURS:
             print(
                 f"   >> [DECISION] HOLD | Reason: MIN_HOLD_NOT_MET | Held: {hold_hours:.2f}h | "
@@ -451,7 +469,7 @@ def generate_signals():
             )
             return
 
-        # --- 4) Dynamic profit hurdle after min-hold ---
+        # 4) Dynamic profit hurdle after min-hold
         effective_hurdle = PROFIT_HURDLE_PCT
 
         bad_regime = ("BEAR" in regime) or ("RECOVERY" in regime)

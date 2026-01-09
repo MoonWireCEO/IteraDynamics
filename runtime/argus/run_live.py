@@ -1,5 +1,12 @@
-# runtime/argus/run_live.py
-# 🦅 ARGUS LIVE SCHEDULER - V2.3 (HEALTHCHECKS HEARTBEAT)
+# /opt/argus/run_live.py
+# 🦅 ARGUS LIVE SCHEDULER - V2.4 (IMPORT-PINNED + SAFE ENV LOADING + HEARTBEAT)
+#
+# FULL FILE REPLACEMENT (SOP)
+#
+# Key fixes:
+# - Ensure /opt/argus is first in sys.path so local apex_core/ is used (not venv site-packages)
+# - Fix .env discovery: load from /opt/argus/.env if present (do NOT override systemd env)
+# - Everything else unchanged: schedule cadence, heartbeat behavior, logging, shutdown handling
 
 from __future__ import annotations
 
@@ -15,18 +22,38 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-# --- ENV ---
-# Load .env from repo root if present; safe no-op if missing.
+# ---------------------------
+# PATH / ENV
+# ---------------------------
+
 _THIS_FILE = Path(__file__).resolve()
-_REPO_ROOT = _THIS_FILE.parents[2] if len(_THIS_FILE.parents) >= 3 else _THIS_FILE.parent
-load_dotenv(_REPO_ROOT / ".env")
+_PROJECT_ROOT = _THIS_FILE.parent  # /opt/argus
 
+# Force local project root to win imports over site-packages
+# This is the core fix for your "server doesn't match github" problem.
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-# --- IMPORT TRADING CYCLE ---
+# Load /opt/argus/.env if present, but NEVER override systemd EnvironmentFile vars.
+_ENV_PATH = _PROJECT_ROOT / ".env"
+if _ENV_PATH.exists():
+    load_dotenv(_ENV_PATH, override=False)
+else:
+    # Best-effort; no override
+    load_dotenv(override=False)
+
+# ---------------------------
+# IMPORT TRADING CYCLE
+# ---------------------------
+
+# Now this will resolve to /opt/argus/apex_core/... if that folder exists.
 from apex_core.signal_generator import generate_signals  # noqa: E402
 
 
-# --- LOGGING ---
+# ---------------------------
+# LOGGING
+# ---------------------------
+
 class Logger:
     def __init__(self, logfile: str = "argus.log"):
         self.terminal = sys.stdout
@@ -46,23 +73,22 @@ sys.stdout = Logger()
 sys.stderr = sys.stdout
 
 
-# --- TIME ---
+# ---------------------------
+# TIME
+# ---------------------------
+
 def utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def utc_time_str() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+# ---------------------------
+# HEALTHCHECKS HEARTBEAT
+# ---------------------------
 
-
-# --- HEALTHCHECKS HEARTBEAT ---
 def _mask_url(url: str) -> str:
-    # Avoid leaking full tokenized URLs in logs
     if not url:
         return ""
     try:
-        # Keep scheme + host only
-        # e.g. https://hc-ping.com/UUID -> https://hc-ping.com/…
         parts = url.split("/")
         if len(parts) >= 3:
             return f"{parts[0]}//{parts[2]}/…"
@@ -81,11 +107,9 @@ def hc_ping(url: Optional[str], timeout_sec: float) -> None:
             headers={"User-Agent": "Argus/heartbeat"},
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            # Consume response to complete request cleanly
             _ = resp.read(0)
         print(f"[{utc_now_str()}] ✅ HEARTBEAT SENT -> {_mask_url(url)}")
     except Exception as e:
-        # Best-effort: never block or raise
         print(f"[{utc_now_str()}] ⚠️ HEARTBEAT FAILED -> {_mask_url(url)} | {e}")
 
 
@@ -95,7 +119,10 @@ HC_FAIL_URL = os.getenv("ARGUS_HEARTBEAT_FAIL_URL", "").strip()
 ALERT_TIMEOUT_SEC = float(os.getenv("ARGUS_ALERT_TIMEOUT_SEC", "2.5"))
 
 
-# --- SHUTDOWN CONTROL ---
+# ---------------------------
+# SHUTDOWN CONTROL
+# ---------------------------
+
 _shutdown_requested = False
 
 
@@ -109,7 +136,10 @@ signal.signal(signal.SIGTERM, _handle_shutdown)
 signal.signal(signal.SIGINT, _handle_shutdown)
 
 
-# --- JOB WRAPPER ---
+# ---------------------------
+# JOB WRAPPER
+# ---------------------------
+
 def job():
     print(f"\n[{utc_now_str()}] 🚀 EXECUTION WINDOW OPEN...")
     try:
@@ -117,12 +147,10 @@ def job():
         generate_signals()
         print(f"[{utc_now_str()}] 💤 Cycle complete. Sleeping...")
 
-        # Heartbeat only after successful cycle completion
         if ARGUS_ALERTS_ENABLED:
             hc_ping(HC_PING_URL, timeout_sec=ALERT_TIMEOUT_SEC)
 
     except Exception as e:
-        # Log and emit "fail" heartbeat if configured; never raise
         print(f"[{utc_now_str()}] ❌ SCHEDULER ERROR: {e}")
         if ARGUS_ALERTS_ENABLED and HC_FAIL_URL:
             hc_ping(HC_FAIL_URL, timeout_sec=ALERT_TIMEOUT_SEC)
