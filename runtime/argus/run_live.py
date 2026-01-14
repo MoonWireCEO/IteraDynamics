@@ -1,12 +1,12 @@
 # /opt/argus/run_live.py
-# 🦅 ARGUS LIVE SCHEDULER - V2.4 (IMPORT-PINNED + SAFE ENV LOADING + HEARTBEAT)
+# 🦅 ARGUS LIVE SCHEDULER - PRIME READY (FULL FILE REPLACEMENT)
 #
-# FULL FILE REPLACEMENT (SOP)
+# - Pins /opt/argus first in sys.path
+# - Loads /opt/argus/.env WITHOUT overriding systemd-provided env
+# - Schedules generate_signals() at the top of every hour
+# - Heartbeat support unchanged
 #
-# Key fixes:
-# - Ensure /opt/argus is first in sys.path so local apex_core/ is used (not venv site-packages)
-# - Fix .env discovery: load from /opt/argus/.env if present (do NOT override systemd env)
-# - Everything else unchanged: schedule cadence, heartbeat behavior, logging, shutdown handling
+# NOTE: Strategy selection happens in apex_core/signal_generator.py via ARGUS_MODE.
 
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ _THIS_FILE = Path(__file__).resolve()
 _PROJECT_ROOT = _THIS_FILE.parent  # /opt/argus
 
 # Force local project root to win imports over site-packages
-# This is the core fix for your "server doesn't match github" problem.
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
@@ -39,14 +38,12 @@ _ENV_PATH = _PROJECT_ROOT / ".env"
 if _ENV_PATH.exists():
     load_dotenv(_ENV_PATH, override=False)
 else:
-    # Best-effort; no override
     load_dotenv(override=False)
 
 # ---------------------------
 # IMPORT TRADING CYCLE
 # ---------------------------
 
-# Now this will resolve to /opt/argus/apex_core/... if that folder exists.
 from apex_core.signal_generator import generate_signals  # noqa: E402
 
 
@@ -118,7 +115,6 @@ HC_PING_URL = os.getenv("ARGUS_HEARTBEAT_PING_URL", "").strip()
 HC_FAIL_URL = os.getenv("ARGUS_HEARTBEAT_FAIL_URL", "").strip()
 ALERT_TIMEOUT_SEC = float(os.getenv("ARGUS_ALERT_TIMEOUT_SEC", "2.5"))
 
-
 # ---------------------------
 # SHUTDOWN CONTROL
 # ---------------------------
@@ -161,8 +157,10 @@ schedule.every().hour.at(":00").do(job)
 
 
 if __name__ == "__main__":
+    mode = os.getenv("ARGUS_MODE", "legacy").strip().lower()
     print("🦅 ARGUS LIVE SCHEDULER ONLINE")
     print(f"⏰ UTC Time: {utc_now_str()}")
+    print(f"🧭 ARGUS_MODE: {mode}")
 
     while not _shutdown_requested:
         schedule.run_pending()
