@@ -121,7 +121,7 @@ IteraDynamics_Mono/
 ### 1. Installation
 
 ```bash
-git clone https://github.com/YourUsername/IteraDynamics_Mono.git
+git clone https://github.com/IteraDynamics/IteraDynamics.git
 cd IteraDynamics_Mono
 pip install -e .
 ```
