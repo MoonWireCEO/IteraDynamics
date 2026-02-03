@@ -1,0 +1,3 @@
+{"client_order_id":"6647179ce9324db69edaf34c49fb4552","mode":"DRY_RUN","product_id":"BTC-USD","side":"BUY","signal_price":100000.0,"target_base_btc":0.0001,"target_quote_usd":10.0,"ts":"2026-02-02T16:27:15.779103+00:00"}
+{"client_order_id":"251725fb42a54c558f75b294a1613a6a","mode":"DRY_RUN","product_id":"BTC-USD","side":"SELL","signal_price":100000.0,"target_base_btc":0.0001,"ts":"2026-02-02T16:27:15.780808+00:00"}
+{"client_order_id":"5ad4c49bbeb34f36adc6bf69b42023a7","mode":"DRY_RUN","product_id":"BTC-USD","side":"SELL","signal_price":100000.0,"target_base_btc":0.001,"ts":"2026-02-02T16:27:15.783531+00:00"}
