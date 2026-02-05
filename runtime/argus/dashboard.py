@@ -127,6 +127,16 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# iOS Home Screen Icon - Replace URL with your hosted icon location
+# Options: GitHub raw URL, your server's static path, or CDN
+APPLE_TOUCH_ICON_URL = "https://raw.githubusercontent.com/IteraDynamics/IteraDynamics/main/runtime/argus/apple-touch-icon.png"
+
+if APPLE_TOUCH_ICON_URL:
+    st.markdown(
+        f'<link rel="apple-touch-icon" href="{APPLE_TOUCH_ICON_URL}">',
+        unsafe_allow_html=True
+    )
+
 st.markdown(
     """
 <style>

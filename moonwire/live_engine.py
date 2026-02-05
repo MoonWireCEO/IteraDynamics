@@ -11,9 +11,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 # --- ARCHITECTURE IMPORTS ---
-from apex_core.paper_broker import PaperBroker
+from moonwire.lib.paper_broker import PaperBroker
 from moonwire.strategies.ml_adapter import MLStrategyAdapter
-from apex_core.train_model import train_brain
+from moonwire.lib.train_model import train_brain
 
 # --- LOGGING SETUP ---
 logging.basicConfig(

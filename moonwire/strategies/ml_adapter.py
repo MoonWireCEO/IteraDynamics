@@ -5,7 +5,7 @@ import numpy as np
 import logging
 from collections import deque
 from pathlib import Path
-import apex_core.feature_builder as fb
+from moonwire.lib import feature_builder as fb
 
 logger = logging.getLogger(__name__)
 

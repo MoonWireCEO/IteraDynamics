@@ -1,0 +1,25 @@
+{
+  "cfg": {
+    "fee_bps": 6.0,
+    "slippage_bps": 10.0,
+    "initial_cash": 100.0,
+    "trade_on_close": true,
+    "min_notional_usd": 5.0
+  },
+  "params": {
+    "sma_slow": 200,
+    "sma_slow_slope_lookback": 24,
+    "sma_fast": 20,
+    "sma_mid": 50,
+    "breakout_lookback": 168,
+    "use_breakout": true,
+    "use_golden_cross": true,
+    "hard_stop_pct": 0.1,
+    "trail_stop_pct": 0.12,
+    "atr_len": 14,
+    "atr_stop_mult": 0.0,
+    "exit_on_close_below_mid": true,
+    "target_fraction": 1.0,
+    "min_bars": 300
+  }
+}
