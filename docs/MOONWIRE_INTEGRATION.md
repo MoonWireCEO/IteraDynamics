@@ -27,12 +27,15 @@ Execution
 
 ## Quick Start
 
-### 1. Export Signals from MoonWire
+### 1. MoonWire owns signal generation; Itera only consumes
+
+**MoonWire (moonwire-backend)** produces the signal feed via its own export script. Itera does not contain any MoonWire inference or feature logic.
+
+**From moonwire-backend** (canonical producer):
 
 ```bash
 cd /path/to/moonwire-backend
 
-# Export BTC signals (2019-2025, hourly)
 python scripts/export_signal_feed.py \
   --product BTC-USD \
   --bar_seconds 3600 \
@@ -43,10 +46,24 @@ python scripts/export_signal_feed.py \
   --horizon_hours 3 \
   --model_dir models/standard
 
-# Output:
-# - feeds/btc_signals.jsonl
-# - feeds/btc_signals.manifest.json
+# Output: feeds/btc_signals.jsonl, feeds/btc_signals.manifest.json
 ```
+
+**From Itera (consumer):** To check that a feed exists, validate it, or request export by calling moonwire-backend as an external process (no inference in Itera):
+
+```bash
+cd /path/to/IteraDynamics_Mono
+
+# Set where the feed should live and where moonwire-backend is
+$env:MOONWIRE_SIGNAL_FILE = "C:\path\to\feeds\btc_signals.jsonl"
+$env:MOONWIRE_BACKEND_ROOT = "C:\path\to\moonwire-backend"
+
+python scripts/ensure_moonwire_signal_feed.py
+```
+
+This script only: (a) checks if the file exists, (b) validates freshness/schema, (c) if missing/stale calls `moonwire-backend/scripts/export_signal_feed.py` via subprocess.
+
+See **`docs/MOONWIRE_FEED_ITERA.md`** for how Itera ensures a feed exists and example PowerShell commands.
 
 **Output Format (JSONL):**
 ```json
@@ -102,7 +119,9 @@ python research/backtests/run_backtest.py \
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `MOONWIRE_SIGNAL_FILE` | ✅ Yes | - | Path to signals.jsonl file |
+| `MOONWIRE_SIGNAL_FILE` | ✅ Yes | - | Path to signals.jsonl file (consumed by Itera) |
+| `MOONWIRE_BACKEND_ROOT` | When using ensure script | - | Path to moonwire-backend repo (so Itera can call export_signal_feed.py if feed missing/stale) |
+| `MOONWIRE_FEED_MAX_AGE_SECONDS` | No | - | If set, feed older than this is considered stale and re-export may be triggered |
 | `MOONWIRE_LONG_THRESH` | No | `0.65` | Probability threshold for LONG (0-1) |
 | `MOONWIRE_SHORT_THRESH` | No | `0.35` | Probability threshold for SHORT (0-1) |
 | `MOONWIRE_ALLOW_SHORT` | No | `0` | Enable SHORT signals (`1` = yes, `0` = no) |

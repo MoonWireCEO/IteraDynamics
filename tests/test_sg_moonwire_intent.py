@@ -18,13 +18,12 @@ import tempfile
 from pathlib import Path
 import pandas as pd
 import pytest
-from research.strategies.sg_moonwire_intent_v1 import (
+from runtime.argus.research.strategies.sg_moonwire_intent_v1 import (
     MoonWireConfig,
     map_probability_to_intent,
     generate_intent,
     validate_feed_alignment,
 )
-from runtime.argus.apex_core.strategy_intent import Action
 
 
 # ============================
@@ -139,6 +138,8 @@ def test_config_defaults(sample_signal_feed):
     assert config.short_thresh == 0.35
     assert config.allow_short is False
     assert config.require_exact_ts is True
+    assert config.strict_ts_match is True
+    assert config.max_exposure == 0.985
 
 
 # ============================
@@ -151,13 +152,13 @@ def test_map_probability_long_signal():
     config.long_thresh = 0.65
     config.short_thresh = 0.35
     config.allow_short = False
-    
+
     intent = map_probability_to_intent(0.75, config)
-    
-    assert intent.action == Action.ENTER_LONG
-    assert intent.confidence == 0.75
-    assert "LONG" in intent.reason
-    assert intent.meta["probability"] == 0.75
+
+    assert intent["action"] == "ENTER_LONG"
+    assert intent["confidence"] == 0.75
+    assert "LONG" in intent["reason"]
+    assert intent["meta"]["probability"] == 0.75
 
 
 def test_map_probability_short_signal_disabled():
@@ -166,12 +167,12 @@ def test_map_probability_short_signal_disabled():
     config.long_thresh = 0.65
     config.short_thresh = 0.35
     config.allow_short = False
-    
+
     intent = map_probability_to_intent(0.25, config)
-    
-    # Should be FLAT, not EXIT, when shorts disabled
-    assert intent.action == Action.FLAT
-    assert "neutral" in intent.reason
+
+    # Should be HOLD (neutral), not EXIT, when shorts disabled
+    assert intent["action"] == "HOLD"
+    assert "neutral" in intent["reason"]
 
 
 def test_map_probability_short_signal_enabled():
@@ -180,51 +181,55 @@ def test_map_probability_short_signal_enabled():
     config.long_thresh = 0.65
     config.short_thresh = 0.35
     config.allow_short = True
-    
+
     intent = map_probability_to_intent(0.25, config)
-    
-    assert intent.action == Action.EXIT  # Using EXIT as SHORT proxy
-    assert "SHORT" in intent.reason
-    assert intent.meta["short_signal"] is True
-    assert intent.confidence == 0.75  # Inverted (1 - 0.25)
+
+    assert intent["action"] == "EXIT"  # Using EXIT as SHORT proxy
+    assert "SHORT" in intent["reason"]
+    assert intent["meta"]["short_signal"] is True
+    assert intent["confidence"] == 0.75  # Inverted (1 - 0.25)
 
 
 def test_map_probability_flat_signal():
-    """Test FLAT signal in neutral zone."""
+    """Test HOLD signal in neutral zone."""
     config = MoonWireConfig()
     config.long_thresh = 0.65
     config.short_thresh = 0.35
     config.allow_short = False
-    
+
     intent = map_probability_to_intent(0.50, config)
-    
-    assert intent.action == Action.FLAT
-    assert "neutral" in intent.reason
-    assert intent.meta["probability"] == 0.50
+
+    assert intent["action"] == "HOLD"
+    assert "neutral" in intent["reason"]
+    assert intent["meta"]["probability"] == 0.50
 
 
 # ============================
 # Integration Tests
 # ============================
 
-def test_generate_intent_exact_match(mock_env, sample_df):
-    """Test generate_intent with exact timestamp match."""
-    # Clear module cache
-    import research.strategies.sg_moonwire_intent_v1 as mw
+def test_generate_intent_exact_match(mock_env, sample_signal_feed):
+    """Test generate_intent with exact timestamp match (last bar = 2024-01-01 00:00, prob=0.5 -> neutral)."""
+    import runtime.argus.research.strategies.sg_moonwire_intent_v1 as mw
     mw._SIGNAL_CACHE = None
     mw._CONFIG_CACHE = None
-    
-    intent = generate_intent(sample_df, ctx=None)
-    
-    # First signal (ts=1704067200) has prob=0.5 (neutral)
-    assert intent.action == Action.FLAT
-    assert "neutral" in intent.reason
+
+    # Single bar at first feed timestamp so we get prob=0.5 (neutral)
+    df = pd.DataFrame(
+        {"Open": 40000.0, "High": 40100.0, "Low": 39900.0, "Close": 40000.0, "Volume": 100.0},
+        index=pd.DatetimeIndex([pd.Timestamp("2024-01-01", tz="UTC")]),
+    )
+    df.index.name = "Timestamp"
+    intent = generate_intent(df, ctx=None)
+
+    assert intent["action"] == "HOLD"
+    assert "neutral" in intent["reason"]
 
 
 def test_generate_intent_missing_timestamp_fail_fast(mock_env):
-    """Test generate_intent fails with missing timestamp when REQUIRE_EXACT_TS=1."""
+    """Test generate_intent fails with missing timestamp when MOONWIRE_STRICT_TS_MATCH=1 (or REQUIRE_EXACT_TS=1)."""
     # Clear module cache
-    import research.strategies.sg_moonwire_intent_v1 as mw
+    import runtime.argus.research.strategies.sg_moonwire_intent_v1 as mw
     mw._SIGNAL_CACHE = None
     mw._CONFIG_CACHE = None
     
@@ -245,7 +250,7 @@ def test_generate_intent_fallback_mode(sample_signal_feed):
     os.environ["MOONWIRE_REQUIRE_EXACT_TS"] = "0"
     
     # Clear module cache
-    import research.strategies.sg_moonwire_intent_v1 as mw
+    import runtime.argus.research.strategies.sg_moonwire_intent_v1 as mw
     mw._SIGNAL_CACHE = None
     mw._CONFIG_CACHE = None
     
@@ -256,11 +261,10 @@ def test_generate_intent_fallback_mode(sample_signal_feed):
     )
     
     intent = generate_intent(df, ctx=None)
-    
-    # Should fall back to nearest prior signal
-    assert intent.action == Action.FLAT
-    assert "stale" in intent.reason
-    assert intent.meta.get("fallback") is True
+
+    # With REQUIRE_EXACT_TS=0 we used to fall back to nearest prior; now we return HOLD/0 (non-strict)
+    assert intent["action"] == "HOLD"
+    assert intent["desired_exposure_frac"] == 0.0
 
 
 # ============================
@@ -270,17 +274,17 @@ def test_generate_intent_fallback_mode(sample_signal_feed):
 def test_determinism(mock_env, sample_df):
     """Test that same inputs produce same outputs."""
     # Clear module cache
-    import research.strategies.sg_moonwire_intent_v1 as mw
+    import runtime.argus.research.strategies.sg_moonwire_intent_v1 as mw
     mw._SIGNAL_CACHE = None
     mw._CONFIG_CACHE = None
     
     intent1 = generate_intent(sample_df, ctx=None)
     intent2 = generate_intent(sample_df, ctx=None)
-    
-    assert intent1.action == intent2.action
-    assert intent1.confidence == intent2.confidence
-    assert intent1.reason == intent2.reason
-    assert intent1.meta["probability"] == intent2.meta["probability"]
+
+    assert intent1["action"] == intent2["action"]
+    assert intent1["confidence"] == intent2["confidence"]
+    assert intent1["reason"] == intent2["reason"]
+    assert intent1["meta"]["probability"] == intent2["meta"]["probability"]
 
 
 # ============================
@@ -298,17 +302,17 @@ def test_validate_feed_alignment_perfect(sample_signal_feed, sample_df):
 
 
 def test_validate_feed_alignment_partial(sample_signal_feed):
-    """Test alignment validation with partial match."""
-    # Create DataFrame with some timestamps outside signal range
+    """Test alignment validation with partial match (feed is 2024-01-01 to 2024-01-07; df extends past)."""
+    # Feed has 168 hours from 2024-01-01; use df that starts after feed ends so most bars are missing
     df = pd.DataFrame(
         {"Close": [40000.0] * 48},
-        index=pd.date_range("2024-01-05", periods=48, freq="h", tz="UTC"),
+        index=pd.date_range("2024-01-10", periods=48, freq="h", tz="UTC"),
     )
-    
+
     result = validate_feed_alignment(df, sample_signal_feed)
-    
+
     assert result["total_bars"] == 48
-    assert result["matched"] < 48  # Some bars outside signal range
+    assert result["matched"] < 48  # Bars in 2024-01-10+ are not in feed (2024-01-01 to 2024-01-07)
     assert result["coverage"] < 1.0
 
 
@@ -317,27 +321,26 @@ def test_validate_feed_alignment_partial(sample_signal_feed):
 # ============================
 
 def test_empty_signal_feed(tmp_path):
-    """Test behavior with empty signal feed."""
+    """Test behavior with empty signal feed (non-strict: HOLD/0 exposure)."""
     empty_file = tmp_path / "empty.jsonl"
     empty_file.write_text("")
-    
+
     os.environ["MOONWIRE_SIGNAL_FILE"] = str(empty_file)
-    os.environ["MOONWIRE_REQUIRE_EXACT_TS"] = "0"
-    
-    # Clear module cache
-    import research.strategies.sg_moonwire_intent_v1 as mw
+    os.environ["MOONWIRE_STRICT_TS_MATCH"] = "0"
+
+    import runtime.argus.research.strategies.sg_moonwire_intent_v1 as mw
     mw._SIGNAL_CACHE = None
     mw._CONFIG_CACHE = None
-    
+
     df = pd.DataFrame(
         {"Close": [40000.0]},
         index=pd.date_range("2024-01-01", periods=1, freq="h", tz="UTC"),
     )
-    
+
     intent = generate_intent(df, ctx=None)
-    
-    assert intent.action == Action.FLAT
-    assert "No MoonWire signals available" in intent.reason
+
+    assert intent["action"] == "HOLD"
+    assert intent["desired_exposure_frac"] == 0.0
 
 
 def test_threshold_edge_cases():
@@ -346,19 +349,91 @@ def test_threshold_edge_cases():
     config.long_thresh = 0.65
     config.short_thresh = 0.35
     config.allow_short = True
-    
+
     # Exactly at LONG threshold
     intent_long = map_probability_to_intent(0.65, config)
-    assert intent_long.action == Action.ENTER_LONG
-    
+    assert intent_long["action"] == "ENTER_LONG"
+
     # Exactly at SHORT threshold
     intent_short = map_probability_to_intent(0.35, config)
-    assert intent_short.action == Action.EXIT
-    
+    assert intent_short["action"] == "EXIT"
+
     # Just above SHORT threshold
     intent_neutral = map_probability_to_intent(0.351, config)
-    assert intent_neutral.action == Action.FLAT
+    assert intent_neutral["action"] == "HOLD"
+
+
+# ============================
+# Experiment 1: geometry adapter tests
+# ============================
+
+
+def test_deterministic_mapping_same_probability_same_exposure():
+    """Deterministic mapping: same feed probability -> same desired_exposure_frac."""
+    config = MoonWireConfig()
+    config.long_thresh = 0.65
+    config.short_thresh = 0.35
+    config.allow_short = False
+
+    for prob in [0.0, 0.5, 0.65, 0.70, 0.99]:
+        a = map_probability_to_intent(prob, config)
+        b = map_probability_to_intent(prob, config)
+        assert a["desired_exposure_frac"] == b["desired_exposure_frac"]
+        assert a["action"] == b["action"]
+
+
+def test_strict_timestamp_match_raises_when_missing(mock_env):
+    """Strict mode: missing bar timestamp in feed raises."""
+    import runtime.argus.research.strategies.sg_moonwire_intent_v1 as mw
+    mw._SIGNAL_CACHE = None
+    mw._CONFIG_CACHE = None
+    os.environ["MOONWIRE_STRICT_TS_MATCH"] = "1"
+
+    df = pd.DataFrame(
+        {"Close": [40000.0]},
+        index=pd.date_range("2025-06-01", periods=1, freq="h", tz="UTC"),
+    )
+    with pytest.raises(KeyError, match="not found in signal feed"):
+        generate_intent(df, ctx=None)
+
+
+def test_non_strict_produces_exposure_zero_when_missing(sample_signal_feed):
+    """Non-strict mode: missing bar timestamp -> HOLD with desired_exposure_frac=0."""
+    os.environ["MOONWIRE_SIGNAL_FILE"] = sample_signal_feed
+    os.environ["MOONWIRE_STRICT_TS_MATCH"] = "0"
+
+    import runtime.argus.research.strategies.sg_moonwire_intent_v1 as mw
+    mw._SIGNAL_CACHE = None
+    mw._CONFIG_CACHE = None
+
+    df = pd.DataFrame(
+        {"Close": [40000.0]},
+        index=pd.date_range("2025-06-01", periods=1, freq="h", tz="UTC"),
+    )
+    intent = generate_intent(df, ctx=None)
+    assert intent["action"] == "HOLD"
+    assert intent["desired_exposure_frac"] == 0.0
+
+
+def test_exposure_capped_at_moonwire_max_exposure():
+    """LONG intent desired_exposure_frac is capped at MOONWIRE_MAX_EXPOSURE."""
+    config = MoonWireConfig()
+    config.long_thresh = 0.65
+    config.short_thresh = 0.35
+    config.allow_short = False
+    config.max_exposure = 0.5  # cap at 50%
+
+    intent = map_probability_to_intent(0.90, config)
+    assert intent["action"] == "ENTER_LONG"
+    assert intent["desired_exposure_frac"] == 0.5
+
+    config.max_exposure = 0.985
+    intent2 = map_probability_to_intent(0.90, config)
+    assert intent2["desired_exposure_frac"] == 0.985
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+
