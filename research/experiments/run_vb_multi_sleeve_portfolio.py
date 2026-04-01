@@ -212,6 +212,7 @@ def _simulate_combined(
     slippage_bps: float,
     allocator_mode: str = "normalize",
     allow_gross_above_one: bool = False,
+    max_secondary_exposure: float | None = None,
     enable_sanity_checks: bool = True,
 ) -> pd.DataFrame:
     df = merged.copy()
@@ -251,6 +252,8 @@ def _simulate_combined(
             w_eth = np.minimum(w_eth, remaining)
     else:
         raise ValueError(f"Unknown allocator_mode: {allocator_mode}")
+
+    w_btc, w_eth = _apply_max_secondary_weights(w_btc, w_eth, max_secondary_exposure)
 
     # Use raw asset returns (not sleeve-equity returns) for portfolio blending.
     r_btc_asset = pd.Series(df["btc_price"].to_numpy(dtype=float)).pct_change().fillna(0.0).to_numpy()
@@ -313,6 +316,206 @@ def _simulate_combined(
     return df
 
 
+def _apply_max_secondary_weights(
+    w_btc: np.ndarray,
+    w_eth: np.ndarray,
+    max_secondary: float | None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Cap secondary (e.g. SOL) weight; clip BTC so gross does not exceed 1."""
+    if max_secondary is None:
+        return w_btc, w_eth
+    cap = float(max_secondary)
+    if not (0.0 <= cap <= 1.0):
+        raise ValueError(f"max_secondary must be in [0,1], got {cap}")
+    w_e = np.minimum(w_eth, cap)
+    w_b = np.minimum(w_btc, 1.0 - w_e)
+    bo = np.minimum(w_b + w_e, 1.0)
+    return w_b, w_e
+
+
+def _simulate_combined_with_risk_overlay(
+    merged: pd.DataFrame,
+    initial_equity: float,
+    *,
+    fee_bps: float,
+    slippage_bps: float,
+    allocator_mode: str = "normalize",
+    allow_gross_above_one: bool = False,
+    max_secondary_exposure: float | None = None,
+    risk_overlay: str = "none",
+    overlay_mode: str | None = None,
+    dd_soft_frac: float = 0.12,
+    dd_hard_frac: float = 0.25,
+    dd_min_mult: float = 0.35,
+    dd_soft: float = 0.05,
+    dd_med: float = 0.10,
+    dd_hard: float = 0.15,
+    dd_kill: float = 0.20,
+    dd_soft_mult: float = 0.85,
+    dd_med_mult: float = 0.65,
+    dd_hard_mult: float = 0.35,
+    dd_kill_mult: float = 0.00,
+    vol_target_ann: float | None = None,
+    vol_window_bars: int = 504,
+    enable_sanity_checks: bool = True,
+) -> pd.DataFrame:
+    """
+    Forward-only simulation: lagged weights × asset returns, turnover costs,
+    plus optional drawdown / vol targeting multiplier on gross exposure.
+    No lookahead: multiplier at bar i uses equity and returns only through i-1.
+    """
+    df = merged.copy()
+    e_btc = np.clip(df["btc_desired_exposure"].to_numpy(dtype=float), 0.0, 1.0)
+    e_eth = np.clip(df["eth_desired_exposure"].to_numpy(dtype=float), 0.0, 1.0)
+    total = e_btc + e_eth
+    mode = (allocator_mode or "normalize").strip().lower()
+    w_btc = np.zeros_like(e_btc, dtype=float)
+    w_eth = np.zeros_like(e_eth, dtype=float)
+
+    if mode == "normalize":
+        no_norm = total <= 1.0
+        w_btc[no_norm] = e_btc[no_norm]
+        w_eth[no_norm] = e_eth[no_norm]
+        need_norm = total > 1.0
+        np.divide(e_btc, total, out=w_btc, where=need_norm)
+        np.divide(e_eth, total, out=w_eth, where=need_norm)
+    elif mode in ("btc_priority", "eth_when_btc_flat"):
+        btc_on = e_btc > 0.0
+        w_btc[btc_on] = np.minimum(e_btc[btc_on], 1.0)
+        w_eth[btc_on] = 0.0
+        btc_off = ~btc_on
+        w_btc[btc_off] = 0.0
+        w_eth[btc_off] = np.minimum(e_eth[btc_off], 1.0)
+    elif mode == "btc_capped_eth":
+        w_btc = np.minimum(e_btc, 1.0)
+        btc_on = w_btc > 0.0
+        w_eth[btc_on] = np.minimum(e_eth[btc_on], 0.25)
+        w_eth[~btc_on] = np.minimum(e_eth[~btc_on], 1.0)
+        if not allow_gross_above_one:
+            remaining = np.maximum(1.0 - w_btc, 0.0)
+            w_eth = np.minimum(w_eth, remaining)
+    else:
+        raise ValueError(f"Unknown allocator_mode: {allocator_mode}")
+
+    w_btc, w_eth = _apply_max_secondary_weights(w_btc, w_eth, max_secondary_exposure)
+
+    r_btc = pd.Series(df["btc_price"].to_numpy(dtype=float)).pct_change().fillna(0.0).to_numpy()
+    r_eth = pd.Series(df["eth_price"].to_numpy(dtype=float)).pct_change().fillna(0.0).to_numpy()
+    ro_raw = overlay_mode if overlay_mode is not None else risk_overlay
+    ro = (ro_raw or "none").strip().lower()
+    use_dd = ro in ("drawdown", "both")
+    use_dd_ladder = ro == "dd_ladder"
+    use_vol = ro in ("vol", "both")
+    if use_dd_ladder:
+        if not (0.0 <= dd_soft <= dd_med <= dd_hard <= dd_kill):
+            raise ValueError("dd ladder thresholds must satisfy 0 <= dd_soft <= dd_med <= dd_hard <= dd_kill")
+        for nm, mv in (
+            ("dd_soft_mult", dd_soft_mult),
+            ("dd_med_mult", dd_med_mult),
+            ("dd_hard_mult", dd_hard_mult),
+            ("dd_kill_mult", dd_kill_mult),
+        ):
+            if not (0.0 <= float(mv) <= 1.0):
+                raise ValueError(f"{nm} must be in [0,1], got {mv}")
+
+    n = len(r_btc)
+    eq = np.zeros(n, dtype=float)
+    eq[0] = initial_equity
+    peak = float(initial_equity)
+    w_bt_l = np.zeros(n, dtype=float)
+    w_et_l = np.zeros(n, dtype=float)
+    port_hist: list[float] = []
+    mult_hist = np.ones(n, dtype=float)
+    dd_hist = np.zeros(n, dtype=float)
+    cost_rate = (fee_bps + slippage_bps) / 10_000.0
+    gross_ret = np.zeros(n, dtype=float)
+    costs = np.zeros(n, dtype=float)
+    net_ret = np.zeros(n, dtype=float)
+    turnover = np.zeros(n, dtype=float)
+
+    for i in range(1, n):
+        if peak < eq[i - 1]:
+            peak = float(eq[i - 1])
+        dd = (peak - eq[i - 1]) / max(peak, 1e-12)
+        dd_hist[i] = dd
+
+        m = 1.0
+        if use_dd:
+            if dd >= dd_hard_frac:
+                m_dd = float(dd_min_mult)
+            elif dd <= dd_soft_frac:
+                m_dd = 1.0
+            else:
+                t = (dd - dd_soft_frac) / max(dd_hard_frac - dd_soft_frac, 1e-12)
+                m_dd = 1.0 - t * (1.0 - float(dd_min_mult))
+            m = min(m, m_dd)
+        if use_dd_ladder:
+            if dd < dd_soft:
+                m_dd_ladder = 1.0
+            elif dd < dd_med:
+                m_dd_ladder = float(dd_soft_mult)
+            elif dd < dd_hard:
+                m_dd_ladder = float(dd_med_mult)
+            elif dd < dd_kill:
+                m_dd_ladder = float(dd_hard_mult)
+            else:
+                m_dd_ladder = float(dd_kill_mult)
+            m = min(m, m_dd_ladder)
+
+        if use_vol and vol_target_ann is not None and vol_target_ann > 0 and len(port_hist) >= int(vol_window_bars):
+            arr = np.array(port_hist[-int(vol_window_bars) :], dtype=float)
+            rv = float(np.std(arr) * np.sqrt(24.0 * 365.25))
+            if rv > 1e-8 and rv > float(vol_target_ann):
+                m = min(m, float(vol_target_ann) / rv)
+
+        mult_hist[i] = m
+
+        wbr = float(w_btc[i - 1])
+        wer = float(w_eth[i - 1])
+        w_bt_l[i] = wbr * m
+        w_et_l[i] = wer * m
+
+        gr = w_bt_l[i] * r_btc[i] + w_et_l[i] * r_eth[i]
+        gross_ret[i] = gr
+        to = abs(w_bt_l[i] - w_bt_l[i - 1]) + abs(w_et_l[i] - w_et_l[i - 1])
+        turnover[i] = to
+        c = to * cost_rate
+        costs[i] = c
+        nr = gr - c
+        net_ret[i] = nr
+        eq[i] = eq[i - 1] * (1.0 + nr)
+        port_hist.append(nr)
+
+    if enable_sanity_checks and not allow_gross_above_one:
+        ge = w_bt_l + w_et_l
+        if np.nanmax(ge) > 1.0000001:
+            raise AssertionError(f"Gross lagged exposure exceeded 1 (mode={mode}): max={np.nanmax(ge):.6f}")
+
+    df["w_btc"] = w_btc
+    df["w_eth"] = w_eth
+    df["w_btc_lag"] = w_bt_l
+    df["w_eth_lag"] = w_et_l
+    # Backward-compatible names plus explicit audit names.
+    df["risk_overlay_mult"] = mult_hist
+    df["portfolio_dd_to_peak"] = dd_hist
+    df["overlay_gross_mult"] = mult_hist
+    df["current_drawdown"] = dd_hist
+    df["overlay_mode"] = ro
+    df["btc_asset_return"] = r_btc
+    df["eth_asset_return"] = r_eth
+    df["btc_contrib"] = w_bt_l * r_btc
+    df["eth_contrib"] = w_et_l * r_eth
+    df["gross_return_before_costs"] = gross_ret
+    df["turnover"] = turnover
+    df["costs"] = costs
+    df["combined_return"] = net_ret
+    df["combined_equity"] = eq
+    df["total_exposure_pre_norm"] = total
+    df["allocator_mode"] = mode
+    df["gross_exposure"] = w_btc + w_eth
+    return df
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run deterministic BTC+ETH multi-sleeve VB portfolio simulation.")
     ap.add_argument("--btc_data", type=str, default=str(_infer_data_path("btc")))
@@ -337,6 +540,64 @@ def main() -> None:
         action="store_true",
         help="Allow gross exposure > 1.0 (only relevant for btc_capped_eth mode).",
     )
+    ap.add_argument(
+        "--max_secondary_exposure",
+        type=float,
+        default=None,
+        help="Cap secondary sleeve weight after allocator (0..1), e.g. 0.02 for 2%% sleeve.",
+    )
+    ap.add_argument(
+        "--risk_overlay",
+        type=str,
+        choices=["none", "drawdown", "vol", "both", "dd_ladder"],
+        default="none",
+        help="Scale gross exposure down from peak drawdown and/or vs trailing vol target (forward-only, no lookahead).",
+    )
+    ap.add_argument(
+        "--overlay_mode",
+        type=str,
+        choices=["none", "drawdown", "vol", "both", "dd_ladder"],
+        default="",
+        help="Optional alias/override for risk overlay mode; defaults to --risk_overlay when omitted.",
+    )
+    ap.add_argument(
+        "--dd_overlay_soft",
+        type=float,
+        default=0.12,
+        help="Portfolio drawdown (from peak) at which overlay starts reducing gross.",
+    )
+    ap.add_argument(
+        "--dd_overlay_hard",
+        type=float,
+        default=0.25,
+        help="Portfolio drawdown at which gross reaches --dd_overlay_min_mult.",
+    )
+    ap.add_argument(
+        "--dd_overlay_min_mult",
+        type=float,
+        default=0.35,
+        help="Minimum gross multiplier at hard drawdown.",
+    )
+    ap.add_argument("--dd_soft", type=float, default=0.05, help="DD ladder soft threshold.")
+    ap.add_argument("--dd_med", type=float, default=0.10, help="DD ladder medium threshold.")
+    ap.add_argument("--dd_hard", type=float, default=0.15, help="DD ladder hard threshold.")
+    ap.add_argument("--dd_kill", type=float, default=0.20, help="DD ladder kill threshold.")
+    ap.add_argument("--dd_soft_mult", type=float, default=0.85, help="DD ladder multiplier in [dd_soft, dd_med).")
+    ap.add_argument("--dd_med_mult", type=float, default=0.65, help="DD ladder multiplier in [dd_med, dd_hard).")
+    ap.add_argument("--dd_hard_mult", type=float, default=0.35, help="DD ladder multiplier in [dd_hard, dd_kill).")
+    ap.add_argument("--dd_kill_mult", type=float, default=0.00, help="DD ladder multiplier in [dd_kill, inf).")
+    ap.add_argument(
+        "--vol_overlay_target_ann",
+        type=float,
+        default=None,
+        help="Annualized vol target (e.g. 0.15). Use with --risk_overlay vol or both.",
+    )
+    ap.add_argument(
+        "--vol_overlay_window",
+        type=int,
+        default=504,
+        help="Trailing bars for realized vol (~504 = 21d at 1h).",
+    )
     ap.add_argument("--audit_rows", type=int, default=100, help="Number of rows to export in audit table.")
     ap.add_argument(
         "--out_audit",
@@ -357,9 +618,14 @@ def main() -> None:
         help="Output path for combined equity curve CSV (default includes cost suffix).",
     )
     args = ap.parse_args()
+    effective_overlay = (args.overlay_mode or args.risk_overlay or "none").strip().lower()
 
     mode_slug = args.allocator_mode
     suffix = f"{mode_slug}_{int(args.fee_bps)}_{int(args.slippage_bps)}"
+    if args.max_secondary_exposure is not None:
+        suffix += f"_sec{str(args.max_secondary_exposure).replace('.', 'p')}"
+    if effective_overlay != "none":
+        suffix += f"_{effective_overlay}"
     if args.out_metrics:
         out_metrics = _suffix_output_path(args.out_metrics, suffix)
     else:
@@ -402,6 +668,18 @@ def main() -> None:
     print(f"Lookback: {args.lookback} | Initial equity: {args.initial_equity:,.2f}")
     print(f"Costs: fee_bps={args.fee_bps}, slippage_bps={args.slippage_bps}")
     print(f"Allocator mode: {args.allocator_mode} | allow_gross_above_one={bool(args.allow_gross_above_one)}")
+    if args.max_secondary_exposure is not None:
+        print(f"Max secondary exposure: {args.max_secondary_exposure:.4f}")
+    if effective_overlay != "none":
+        print(
+            f"Risk overlay: {effective_overlay} | dd_soft={args.dd_overlay_soft} dd_hard={args.dd_overlay_hard} "
+            f"dd_min_mult={args.dd_overlay_min_mult} | vol_target_ann={args.vol_overlay_target_ann} window={args.vol_overlay_window}"
+        )
+    if effective_overlay == "dd_ladder":
+        print(
+            f"DD ladder: thresholds={args.dd_soft}/{args.dd_med}/{args.dd_hard}/{args.dd_kill} | "
+            f"mult={args.dd_soft_mult}/{args.dd_med_mult}/{args.dd_hard_mult}/{args.dd_kill_mult}"
+        )
 
     btc_df = _run_sleeve(
         btc_cfg,
@@ -419,15 +697,43 @@ def main() -> None:
     )
 
     merged = _align_sleeves(btc_df, eth_df)
-    sim = _simulate_combined(
-        merged,
-        initial_equity=args.initial_equity,
-        fee_bps=args.fee_bps,
-        slippage_bps=args.slippage_bps,
-        allocator_mode=args.allocator_mode,
-        allow_gross_above_one=bool(args.allow_gross_above_one),
-        enable_sanity_checks=True,
-    )
+    if effective_overlay != "none":
+        sim = _simulate_combined_with_risk_overlay(
+            merged,
+            initial_equity=args.initial_equity,
+            fee_bps=args.fee_bps,
+            slippage_bps=args.slippage_bps,
+            allocator_mode=args.allocator_mode,
+            allow_gross_above_one=bool(args.allow_gross_above_one),
+            max_secondary_exposure=args.max_secondary_exposure,
+            risk_overlay=effective_overlay,
+            overlay_mode=effective_overlay,
+            dd_soft_frac=float(args.dd_overlay_soft),
+            dd_hard_frac=float(args.dd_overlay_hard),
+            dd_min_mult=float(args.dd_overlay_min_mult),
+            dd_soft=float(args.dd_soft),
+            dd_med=float(args.dd_med),
+            dd_hard=float(args.dd_hard),
+            dd_kill=float(args.dd_kill),
+            dd_soft_mult=float(args.dd_soft_mult),
+            dd_med_mult=float(args.dd_med_mult),
+            dd_hard_mult=float(args.dd_hard_mult),
+            dd_kill_mult=float(args.dd_kill_mult),
+            vol_target_ann=args.vol_overlay_target_ann,
+            vol_window_bars=int(args.vol_overlay_window),
+            enable_sanity_checks=True,
+        )
+    else:
+        sim = _simulate_combined(
+            merged,
+            initial_equity=args.initial_equity,
+            fee_bps=args.fee_bps,
+            slippage_bps=args.slippage_bps,
+            allocator_mode=args.allocator_mode,
+            allow_gross_above_one=bool(args.allow_gross_above_one),
+            max_secondary_exposure=args.max_secondary_exposure,
+            enable_sanity_checks=True,
+        )
 
     m_btc = _compute_metrics(
         sim["Timestamp"],
@@ -465,6 +771,8 @@ def main() -> None:
                 "fee_bps": args.fee_bps,
                 "slippage_bps": args.slippage_bps,
                 "allocator_mode": args.allocator_mode,
+                "max_secondary_exposure": args.max_secondary_exposure,
+                "risk_overlay": effective_overlay,
             }
         )
     metrics_df = pd.DataFrame(rows)
@@ -473,31 +781,35 @@ def main() -> None:
     out_equity.parent.mkdir(parents=True, exist_ok=True)
     out_audit.parent.mkdir(parents=True, exist_ok=True)
     metrics_df.to_csv(out_metrics, index=False)
-    sim_out = sim[
-        [
-            "Timestamp",
-            "btc_equity",
-            "eth_equity",
-            "combined_equity",
-            "btc_return",
-            "eth_return",
-            "btc_asset_return",
-            "eth_asset_return",
-            "combined_return",
-            "btc_desired_exposure",
-            "eth_desired_exposure",
-            "total_exposure_pre_norm",
-            "w_btc",
-            "w_eth",
-            "w_btc_lag",
-            "w_eth_lag",
-            "btc_contrib",
-            "eth_contrib",
-            "gross_return_before_costs",
-            "turnover",
-            "costs",
-        ]
-    ].copy()
+    _equity_cols = [
+        "Timestamp",
+        "btc_equity",
+        "eth_equity",
+        "combined_equity",
+        "btc_return",
+        "eth_return",
+        "btc_asset_return",
+        "eth_asset_return",
+        "combined_return",
+        "btc_desired_exposure",
+        "eth_desired_exposure",
+        "total_exposure_pre_norm",
+        "w_btc",
+        "w_eth",
+        "w_btc_lag",
+        "w_eth_lag",
+        "btc_contrib",
+        "eth_contrib",
+        "gross_return_before_costs",
+        "turnover",
+        "costs",
+    ]
+    _extra = [
+        c
+        for c in ("risk_overlay_mult", "portfolio_dd_to_peak", "overlay_gross_mult", "current_drawdown", "overlay_mode")
+        if c in sim.columns
+    ]
+    sim_out = sim[_equity_cols + _extra].copy()
     sim_out.to_csv(out_equity, index=False)
 
     audit_cols = [
@@ -521,6 +833,16 @@ def main() -> None:
         "combined_return",
         "combined_equity",
     ]
+    if "risk_overlay_mult" in sim.columns:
+        audit_cols.insert(-1, "risk_overlay_mult")
+    if "portfolio_dd_to_peak" in sim.columns:
+        audit_cols.insert(-1, "portfolio_dd_to_peak")
+    if "overlay_gross_mult" in sim.columns:
+        audit_cols.insert(-1, "overlay_gross_mult")
+    if "current_drawdown" in sim.columns:
+        audit_cols.insert(-1, "current_drawdown")
+    if "overlay_mode" in sim.columns:
+        audit_cols.insert(-1, "overlay_mode")
     audit_n = max(1, int(args.audit_rows))
     sim[audit_cols].head(audit_n).to_csv(out_audit, index=False)
 

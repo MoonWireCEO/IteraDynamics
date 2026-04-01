@@ -142,6 +142,22 @@ def load_strategy_func(module_path: str, func_name: str) -> Callable:
 # Action normalization
 # ---------------------------
 
+def _tactical_mr_permission_active(intent: Dict[str, Any]) -> bool:
+    """
+    True when MR tactical signal would express long (permission / risk-on hint).
+    EXIT or flat desired_exposure => False. Does not open independent MR positions.
+    """
+    a = str(intent.get("action", "HOLD")).strip().upper()
+    if a in ("EXIT", "EXIT_LONG", "SELL", "CLOSE"):
+        return False
+    d = float(intent.get("desired_exposure_frac") or 0.0)
+    if d <= 1e-12:
+        return False
+    if a in ("BUY", "LONG", "ENTER", "ENTER_LONG"):
+        return True
+    return False
+
+
 def _normalize_action(action: Optional[str]) -> str:
     """Normalize action string to canonical form."""
     if not action:
@@ -212,13 +228,17 @@ def run_backtest(
     slippage_bps: float = 5.0,
     closed_only: bool = True,
     moonwire_feed: Optional[Dict[int, float]] = None,
+    tactical_mr_func: Optional[Callable] = None,
+    tactical_overlay_mult: float = 1.0,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Walk-forward backtest using Layer 2 generate_intent.
 
     At each bar i (for i >= lookback):
       1. Call strategy_func(df[:i+1], ctx, closed_only=closed_only)
-      2. If moonwire_feed is set, apply MoonWire overlay to desired_exposure_frac (Core unchanged).
+      2. Optional Layer 3: if tactical_mr_func and mult>1 and core desired>0 and MR permission active,
+         scale desired_exposure_frac (VB remains sole position generator).
+      3. If moonwire_feed is set, apply MoonWire overlay to post-tactical desired_exposure_frac.
       3. Process action & desired_exposure_frac
       4. Adjust position to match desired exposure
 
@@ -280,14 +300,28 @@ def run_backtest(
         action = _normalize_action(intent.get("action"))
         core_desired_expo = float(intent.get("desired_exposure_frac") or 0.0)
         core_desired_expo = max(0.0, min(1.0, core_desired_expo))
+        vb_core_desired = core_desired_expo
         desired_expo = core_desired_expo
+        mr_tactical_active = False
+        tactical_mult_applied = 1.0
+        tom = float(tactical_overlay_mult)
+        if tactical_mr_func is not None and tom > 1.0 and core_desired_expo > 1e-12:
+            try:
+                mr_intent = tactical_mr_func(df_slice, ctx, closed_only=closed_only)
+            except Exception:
+                mr_intent = {"action": "HOLD", "desired_exposure_frac": 0.0, "meta": {}}
+            if _tactical_mr_permission_active(mr_intent):
+                tactical_mult_applied = tom
+                desired_expo = min(core_desired_expo * tom, 1.0)
+                mr_tactical_active = True
+        pre_moonwire_desired = desired_expo
         moonwire_state: Optional[str] = None
         moonwire_multiplier: Optional[float] = None
         if moonwire_feed is not None:
             from research.governance.moonwire_overlay import apply_overlay
             try:
                 ts_unix = int(pd.Timestamp(ts).timestamp()) if hasattr(ts, "timestamp") else int(ts)
-                desired_expo, overlay_meta = apply_overlay(core_desired_expo, ts_unix, moonwire_feed)
+                desired_expo, overlay_meta = apply_overlay(pre_moonwire_desired, ts_unix, moonwire_feed)
                 desired_expo = max(0.0, min(1.0, desired_expo))
                 moonwire_state = overlay_meta.get("moonwire_state")
                 moonwire_multiplier = overlay_meta.get("moonwire_multiplier")
@@ -355,8 +389,12 @@ def run_backtest(
             "fee_slippage_this_bar": cost_this_bar,
             "rebalanced": rebalanced,
         }
+        if tactical_mr_func is not None:
+            row["vb_core_desired_exposure_frac"] = vb_core_desired
+            row["mr_tactical_active"] = bool(mr_tactical_active)
+            row["tactical_overlay_mult_applied"] = float(tactical_mult_applied)
         if moonwire_feed is not None:
-            row["core_desired_exposure_frac"] = core_desired_expo
+            row["core_desired_exposure_frac"] = pre_moonwire_desired
             row["moonwire_state"] = moonwire_state
             row["moonwire_multiplier"] = moonwire_multiplier
         equity_rows.append(row)

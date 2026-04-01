@@ -3,7 +3,8 @@ Run a Layer-2 strategy via the Argus research harness on an asset OHLCV CSV
 (applies the same walk-forward harness logic as BTC).
 
 Notes:
-  - Does NOT modify the harness/backtest engine.
+  - Does NOT modify harness/backtest engine internals; loads CSVs with flexible headers
+    then passes canonical OHLCV columns to run_backtest.
   - Computes extra metrics (profit factor, # trades) from the harness equity/exposure
     trace by treating exposure>1% as "in trade" segments.
   - Optional --start_date / --end_date slice the loaded OHLCV before any strategy/backtest
@@ -28,7 +29,6 @@ if str(ARGUS_DIR) not in sys.path:
     sys.path.insert(0, str(ARGUS_DIR))
 
 from research.harness.backtest_runner import (  # noqa: E402
-    load_flight_recorder,
     load_strategy_func,
     run_backtest,
 )
@@ -141,6 +141,61 @@ def _infer_data_path(asset: str) -> Path:
     return p
 
 
+def _load_ohlcv_for_harness(csv_path: Path) -> pd.DataFrame:
+    """
+    Load OHLCV CSV into the canonical harness column names.
+
+    Repo data files often use lowercase (timestamp, open, high, low, close, volume).
+    load_flight_recorder in backtest_runner requires Timestamp + Open/High/Low/Close.
+    Normalizing here keeps experiment tooling working without editing harness internals.
+    """
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Data file not found: {csv_path}")
+    raw = pd.read_csv(csv_path)
+    if raw.empty:
+        raise ValueError(f"CSV is empty: {csv_path}")
+
+    lower_to_actual = {str(c).strip().lower(): c for c in raw.columns}
+
+    def _pick(*names: str) -> str | None:
+        for n in names:
+            c = lower_to_actual.get(n.lower())
+            if c is not None:
+                return c
+        return None
+
+    col_ts = _pick("Timestamp", "timestamp", "ts", "datetime", "date")
+    col_o = _pick("Open", "open", "o")
+    col_h = _pick("High", "high", "h")
+    col_l = _pick("Low", "low", "l")
+    col_c = _pick("Close", "close", "c")
+    col_v = _pick("Volume", "volume", "v")
+    if any(c is None for c in (col_ts, col_o, col_h, col_l, col_c)):
+        raise ValueError(
+            f"CSV missing required OHLCV columns. Found: {list(raw.columns)}"
+        )
+
+    out = pd.DataFrame(
+        {
+            "Timestamp": pd.to_datetime(raw[col_ts], utc=True, errors="coerce"),
+            "Open": pd.to_numeric(raw[col_o], errors="coerce"),
+            "High": pd.to_numeric(raw[col_h], errors="coerce"),
+            "Low": pd.to_numeric(raw[col_l], errors="coerce"),
+            "Close": pd.to_numeric(raw[col_c], errors="coerce"),
+            "Volume": pd.to_numeric(raw[col_v], errors="coerce")
+            if col_v is not None
+            else 0.0,
+        }
+    )
+    out = out.dropna(subset=["Timestamp", "Open", "High", "Low", "Close"]).sort_values(
+        "Timestamp"
+    ).reset_index(drop=True)
+    if out["Volume"].isna().all():
+        out["Volume"] = 0.0
+    out["Volume"] = out["Volume"].fillna(0.0)
+    return out
+
+
 def _slice_ohlcv_by_dates(
     df: pd.DataFrame,
     start_date: Optional[str],
@@ -219,6 +274,8 @@ def _run_harness_once(
     fee_bps: float,
     slippage_bps: float,
     exposure_threshold: float,
+    tactical_mr_func: Callable | None = None,
+    tactical_overlay_mult: float = 1.0,
 ) -> Tuple[pd.DataFrame, Dict[str, Any], float, int]:
     equity_df, metrics = run_backtest(
         df,
@@ -229,6 +286,8 @@ def _run_harness_once(
         slippage_bps=slippage_bps,
         closed_only=True,
         moonwire_feed=None,
+        tactical_mr_func=tactical_mr_func,
+        tactical_overlay_mult=float(tactical_overlay_mult),
     )
 
     segs = _compute_trade_segments(equity_df, exposure_threshold=exposure_threshold)
@@ -358,6 +417,30 @@ def main() -> None:
         action="store_true",
         help="In regime_mode, run and print UNGATED vs GATED side-by-side.",
     )
+    ap.add_argument(
+        "--tactical_overlay_path",
+        type=str,
+        default="",
+        help="Research-only: path to MR tactical module .py (e.g. research/strategies/sg_mean_reversion_vwap_rsi_v1.py).",
+    )
+    ap.add_argument(
+        "--tactical_overlay_module",
+        type=str,
+        default="",
+        help="Research-only: import path for MR tactical generate_intent (alternative to --tactical_overlay_path).",
+    )
+    ap.add_argument(
+        "--tactical_overlay_func",
+        type=str,
+        default="generate_intent",
+        help="Callable name in tactical overlay module (default generate_intent).",
+    )
+    ap.add_argument(
+        "--tactical_overlay_mult",
+        type=float,
+        default=1.15,
+        help="Multiply VB desired_exposure when MR tactical permission active (default 1.15). Ignored if no tactical module.",
+    )
     args = ap.parse_args()
 
     asset = args.asset.strip().lower()
@@ -369,7 +452,7 @@ def main() -> None:
     if not data_path.exists():
         raise FileNotFoundError(f"Data CSV not found: {data_path}")
 
-    df_full = load_flight_recorder(str(data_path))
+    df_full = _load_ohlcv_for_harness(data_path)
 
     # Strategy load:
     # - Default: import by module path via Argus loader
@@ -401,6 +484,29 @@ def main() -> None:
         gate_ema_len=args.gate_ema_len,
     )
 
+    tactical_mr_func: Callable | None = None
+    tactical_overlay_mult = float(args.tactical_overlay_mult)
+    to_path = (args.tactical_overlay_path or "").strip()
+    to_mod = (args.tactical_overlay_module or "").strip()
+    to_fn = (args.tactical_overlay_func or "generate_intent").strip()
+    if to_path:
+        tp = Path(to_path).expanduser()
+        if not tp.is_absolute():
+            tp = (REPO_ROOT / tp).resolve()
+        if not tp.exists():
+            raise FileNotFoundError(f"Tactical overlay file not found: {tp}")
+        unique_name = f"file_tactical_{tp.stem}"
+        spec = importlib.util.spec_from_file_location(unique_name, str(tp))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Failed to load tactical overlay: {tp}")
+        tmod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tmod)  # type: ignore[attr-defined]
+        tactical_mr_func = getattr(tmod, to_fn, None)
+        if tactical_mr_func is None or not callable(tactical_mr_func):
+            raise AttributeError(f"Tactical overlay file '{tp}' has no callable '{to_fn}'")
+    elif to_mod:
+        tactical_mr_func = load_strategy_func(to_mod, to_fn)
+
     if args.regime_mode:
         regime_rows: List[Dict[str, Any]] = []
         print("=" * 60)
@@ -418,6 +524,10 @@ def main() -> None:
         if args.regime_gate_mode == "trend_up_ema":
             print(f"Gate EMA len    : {args.gate_ema_len}")
         print(f"Compare ungated : {bool(args.compare_ungated)}")
+        if tactical_mr_func is not None:
+            print(f"Tactical MR overlay: ON | mult={tactical_overlay_mult}")
+        else:
+            print("Tactical MR overlay: OFF")
 
         for regime_name, w_start, w_end in REGIME_WINDOWS:
             sliced = _slice_ohlcv_by_dates(df_full, w_start, w_end)
@@ -460,6 +570,8 @@ def main() -> None:
                     fee_bps=args.fee_bps,
                     slippage_bps=args.slippage_bps,
                     exposure_threshold=args.exposure_threshold,
+                    tactical_mr_func=tactical_mr_func,
+                    tactical_overlay_mult=tactical_overlay_mult,
                 )
             except Exception as e:
                 print(f"\n[{regime_name}] ERROR: {e}")
@@ -494,6 +606,8 @@ def main() -> None:
                     fee_bps=args.fee_bps,
                     slippage_bps=args.slippage_bps,
                     exposure_threshold=args.exposure_threshold,
+                    tactical_mr_func=tactical_mr_func,
+                    tactical_overlay_mult=tactical_overlay_mult,
                 )
                 regime_rows.append(
                     {
@@ -651,6 +765,10 @@ def main() -> None:
     print(f"Initial equity  : ${args.initial_equity:,.2f}")
     print(f"Fee (bps)       : {args.fee_bps}")
     print(f"Slippage (bps) : {args.slippage_bps}")
+    if tactical_mr_func is not None:
+        print(f"Tactical MR overlay: ON | mult={tactical_overlay_mult}")
+    else:
+        print("Tactical MR overlay: OFF")
 
     strategy_func_single = strategy_func_gated
     equity_df, metrics, profit_factor, n_trades = _run_harness_once(
@@ -661,6 +779,8 @@ def main() -> None:
         fee_bps=args.fee_bps,
         slippage_bps=args.slippage_bps,
         exposure_threshold=args.exposure_threshold,
+        tactical_mr_func=tactical_mr_func,
+        tactical_overlay_mult=tactical_overlay_mult,
     )
 
     _print_metrics_summary(metrics, profit_factor, n_trades)
@@ -688,6 +808,11 @@ def main() -> None:
     out_df["n_trades"] = n_trades
     out_df["avg_exposure"] = metrics["avg_exposure"]
     out_df["time_in_market"] = metrics["time_in_market"]
+    if tactical_mr_func is not None:
+        for col in ("vb_core_desired_exposure_frac", "mr_tactical_active", "tactical_overlay_mult_applied"):
+            if col in equity_df.columns:
+                out_df[col] = equity_df[col]
+        out_df["tactical_overlay_mult_config"] = tactical_overlay_mult
 
     out_df.to_csv(out_path, index=False)
     print(f"Wrote: {out_path}")
